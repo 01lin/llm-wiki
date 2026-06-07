@@ -16,4 +16,4 @@ Perform a full health check:
 8. Fix automatically where possible (broken links, missing frontmatter)
 
 Output report to wiki/lint-report-{date}.md.
-Update wiki/log.md.
+Update wiki/20260412-194306-wiki-log-日志.md.

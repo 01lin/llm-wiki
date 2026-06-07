@@ -14,8 +14,8 @@ structured pages, not raw chunks. Every query compounds the system.
 
 ### Wiki
 
-- `wiki/index.md` - Master index linking every page with TLDR for fast scanning
-- `wiki/log.md` - Append-only changelog of all operations
+- `wiki/20260412-194246-wiki-index-索引.md` - Master index linking every page with TLDR for fast scanning
+- `wiki/20260412-194306-wiki-log-日志.md` - Append-only changelog of all operations
 - `wiki/concepts/` - Concept pages (ideas, frameworks, topics)
 - `wiki/entities/` - Entity pages (people, companies, tools, protocols)
 - `wiki/sources/` - Source summary pages (one per raw source)
@@ -175,17 +175,17 @@ This prevents the wiki from becoming an echo chamber that agrees with every sour
 7. Update existing pages - append new info, never rewrite from scratch
 8. Add `[[wikilinks]]` to connect new content to existing pages
 9. Run bias check: add counter-arguments and data gaps sections
-10. Update `wiki/index.md` with new entries and TLDRs
-11. Append to `wiki/log.md` with date, operation, pages touched
+10. Update `wiki/20260412-194246-wiki-index-索引.md` with new entries and TLDRs
+11. Append to `wiki/20260412-194306-wiki-log-日志.md` with date, operation, pages touched
 
 ### QUERY
 
-1. Read `wiki/index.md` - scan TLDRs only
+1. Read `wiki/20260412-194246-wiki-index-索引.md` - scan TLDRs only
 2. Identify relevant pages from TLDRs (skip irrelevant ones to save tokens)
 3. Read full content of relevant pages
 4. Synthesize an answer with citations to specific `[[wiki pages]]`
 5. Save the answer as `wiki/outputs/{question-slug}.md` with `type: output`
-6. Update `wiki/index.md` and `wiki/log.md`
+6. Update `wiki/20260412-194246-wiki-index-索引.md` and `wiki/20260412-194306-wiki-log-日志.md`
 
 ### EXPLORE
 
@@ -198,7 +198,7 @@ This prevents the wiki from becoming an echo chamber that agrees with every sour
 7. Update related concept and entity pages with cross-references
 8. Set `confidence` based on source quality and corroboration
 9. Set `explored: false` (always - only the user validates)
-10. Update `wiki/index.md` and `wiki/log.md`
+10. Update `wiki/20260412-194246-wiki-index-索引.md` and `wiki/20260412-194306-wiki-log-日志.md`
 
 ### LINT
 
@@ -215,7 +215,7 @@ This prevents the wiki from becoming an echo chamber that agrees with every sour
 ### COMPILE (rebuild indexes)
 
 1. Scan all wiki pages
-2. Regenerate `wiki/index.md` with current page list and TLDRs
+2. Regenerate `wiki/20260412-194246-wiki-index-索引.md` with current page list and TLDRs
 3. Verify all `[[wikilinks]]` resolve to existing pages
 4. Create stubs for any unresolved links
 
@@ -237,8 +237,8 @@ This prevents the wiki from becoming an echo chamber that agrees with every sour
 - Link only the first occurrence of a concept per section
 - Bold key terms on first use in each article
 - No em dashes - use regular dashes or commas
-- All filenames: kebab-case, lowercase
-- Source summaries: `{author-or-source}-{year}-{short-title}.md`
+- Content filenames: `YYYYMMDD-HHMMSS-{task}-{result}.{ext}`. Use lowercase kebab-case for Latin task words and keep CJK where it carries meaning.
+- Source summary task names should still identify the source or author and short title when possible.
 
 ## External Integrations
 

@@ -5,7 +5,7 @@ allowed-tools: Read, Write, Edit, Bash, Glob, Grep
 
 Read CLAUDE.md for all conventions and operations.
 
-Read wiki/index.md to understand existing coverage.
+Read wiki/20260412-194246-wiki-index-索引.md to understand existing coverage.
 
 PHASE 0 - SORT CLIPPINGS:
 Check raw/clippings/ for new files. For each, detect the type from
@@ -50,8 +50,8 @@ For each source (now containing full content + media):
 6. Update existing pages by appending new information
 7. Add [[wikilinks]] to connect new content to existing pages
 8. Include Counter-arguments and Data gaps sections where required
-9. Update wiki/index.md with new entries and TLDRs
-10. Append to wiki/log.md with date, operation type, pages touched
+9. Update wiki/20260412-194246-wiki-index-索引.md with new entries and TLDRs
+10. Append to wiki/20260412-194306-wiki-log-日志.md with date, operation type, pages touched
 
 Never leave a [[wikilink]] pointing to nothing - create stubs.
 Never rewrite existing pages from scratch - append and update.
