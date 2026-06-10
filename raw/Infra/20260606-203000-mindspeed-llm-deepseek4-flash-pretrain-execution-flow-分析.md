@@ -847,7 +847,7 @@ def sparse_attention(self, query, ori_kv, cmp_kv, cmp_sparse_indices, sinks, ...
 **关键结论**：
 - 脚本 `DSA_ARGS` 设了 `--use-sparse-flash-attn` 但**没有** `--use-triton-sfa` → 生产路径走 **AscendC `npu_sparse_attn_shared_kv`**，不是 Triton。
 - Triton 的 `SparseFlashAttentionTriton`（`g2_attention_kernel.py`）是**对标/备用实现**，代码完整可读，适合理解算法语义和定位瓶颈本质。
-- AscendC 训练版 forward 返回 `softmax_lse=True` 且有反向 `npu_sparse_attn_shared_kv_grad`；但 ops-transformer 当前检出里 `experimental/.../sparse_attn_sharedkv` 是**推理版**（README 明确：仅推理、不返 LSE、A3 only），训练版 fwd(带LSE)+grad 算子未在检出中。结构等价的可读训练反向是主目录 `attention/sparse_flash_attention_grad`，本章用它做反向结构分析。
+- MindSpeed 训练封装要求 forward 返回 LSE，并调用 `npu_sparse_attn_shared_kv_grad`。ops-transformer 的 README 仍标注“仅推理、不返 LSE”，但当前正向内核源码已经包含 `ProcessLse()` 和 `returnSoftmaxLse` 分支，说明文档与代码版本不同步。**当前真正缺失的是生产符号 `aclnnSparseAttnSharedkvGrad` 的精确内核源码**；第十一章使用公式完全一致、结构更接近的 `SparseFlashMlaGrad` 作反向旁证。
 
 ### 9.1 算子三件套与 shape（来自脚本参数）
 
@@ -857,7 +857,7 @@ def sparse_attention(self, query, ori_kv, cmp_kv, cmp_sparse_indices, sinks, ...
 | Q heads (N1) | 64 | `--num-attention-heads 64` |
 | KV heads (N2) | **1** | shared-KV（MQA）`num_heads_kv=1` |
 | QK head_dim (D) | **512** | `--qk-head-dim 512`（MLA up-proj 维度） |
-| V head_dim | 128 | `--v-head-dim 128` |
+| 模型配置中的 V head_dim | 128 | `--v-head-dim 128`；**注意：它不是 `SparseAttnSharedKV` 算子的 V 维。本算子使用同一个 KV 同时充当 K/V，实际 K=V=D=512** |
 | topk (K) | 512 | `--index-topk 512` |
 | window | 128 | `--g2-window-size 128` |
 | 有效选取列 | ~640 | window(128)+topk(512)，匹配 `CONFIG_MAP[640]` |
@@ -897,7 +897,9 @@ _inner_fwd 五段式流水线 (AIC/AIV 1:2 mix mode):
 - Cube/Vector 跨核同步：`SYNC_V0_C1 / C1_V1 / V1_C2 / C2_V2`（4 级 flag），`PRELOAD_NUM=2` 双缓冲预取。
 - `metadata` 由 AICPU 预先算好分核结果，避免设备端动态分核开销。
 
-### 9.3 反向算子结构（backward，`sparse_flash_attention_grad`）
+### 9.3 反向算子结构代理（backward，`sparse_flash_attention_grad`）
+
+> **精确性说明**：本节原先使用 K/V 分离、V 维为 128 的通用 `sparse_flash_attention_grad` 作结构代理。实际 `SparseAttnSharedkvGrad` 使用共享的 `K=V`，且 D=512；因此本节只用于理解“五个矩阵乘、稀疏 gather/scatter、AIC/AIV 协同”的共性，不应把其中的维度、workspace 和优化开关逐项等同于生产算子。实际 SharedKV 语义与更接近的开源旁证见第十一章。
 
 反向是标准 FlashAttention 反向的稀疏版，**5 个 matmul（C1-C5）+ 稀疏 Gather + 稀疏 Scatter**，AIC/AIV 1:2 mix：
 
@@ -967,7 +969,7 @@ SetAtomicNone();
 
 | 优化项 | 改法 | 预期收益 | 可行性 | 风险/前提 |
 |--------|------|---------|:------:|----------|
-| **O1 确定性散射替代原子** | backward 用 `ScatterAddDeter`（workspace 规约）替代 `SetAtomicAdd` | 消除 64-head 原子竞争 | **高**（代码已实现，切开关） | 需额外 workspace；确定性计算本就是训练推荐 |
+| **O1 确定性散射替代原子** | 参考通用代理算子的 `ScatterAddDeter`，用 workspace 规约替代 `SetAtomicAdd` | 消除 64-head 原子竞争 | **中**（代理算子已有，SharedKVGrad 需确认或移植） | 需额外 workspace；生产二进制未暴露同名开关 |
 | **O2 dK/dV head 内先聚后散** | 64 head 在 UB/L1 先累加成 1 份再 scatter，原子次数 64→1 | 直接砍原子竞争量级 | **中高** | 需 UB 容量容纳 head 聚合，改 kernel |
 | **O3 bf16 散射/workspace** | scatter 中间量 fp32→bf16 | 访存减半 | **中** | 精度风险，需对齐 loss 曲线 |
 | **O4 Gather 与 matmul 融合** | 减少 selectedKWorkSpaceGm 往返 | 省一次 GM round-trip | **中**（Cube 不能按索引 load，只能优化 overlap） | 已有 ping-pong，空间有限 |
@@ -986,7 +988,7 @@ SetAtomicNone();
 
 ### 9.7 待补充（当前检出缺口）
 
-- **训练版 `aclnnSparseAttnSharedkvGrad` 与带 LSE 的 forward 不在 ops-transformer 检出中**——本章反向以结构等价的 `sparse_flash_attention_grad` 推断。若要精确到生产 grad kernel 的 tiling/buffer，需补拉对应算子源码。
+- **生产版 `aclnnSparseAttnSharedkvGrad` 的精确内核源码不在当前检出中**。带 LSE 的 forward 路径已能从当前源码确认；反向可由 `SparseFlashMlaGrad` 的同语义实现作强旁证。若要精确到生产 grad 的 tiling key、buffer 地址和指令时序，仍需补拉对应 CANN 源码版本。
 - `fused_sparse_attn_shared_kv_kvallgather`（CP>1 路径）本脚本 CP=1 未触发，未展开；后续开 CP 需单独分析其 kvallgather 通信叠加。
 
 ---
@@ -1002,7 +1004,7 @@ SetAtomicNone();
 > | 4 | `MatmulV3` | 8% | 通用 GEMM |
 >
 > 本章聚焦 Top2，逐层打开 kernel，量化"访存 bound、MAC 低"的根因。
-> 说明：生产 `sparseAttnSharedkvGrad` 为 CANN 二进制，源码不在检出；本章以结构等价的 `sparse_flash_attention_grad`（完整源码）做剖析，计算图与访存模式一致。
+> 说明：生产 `sparseAttnSharedkvGrad` 为 CANN 二进制，源码不在检出；本章以 `sparse_flash_attention_grad` 做通用结构旁证。两者都有重算、五个矩阵乘、稀疏 gather/scatter 等共性，但 SharedKV 是 `K=V=D=512`，不能把本章的 `V=128`、workspace 排布和优化开关逐行等同于生产算子。第十一章使用更接近的 `SparseFlashMlaGrad` 开源实现校正这一点。
 
 ### 10.1 根因一（最关键）：稀疏 per-query 选择把 matmul M 维压到 gSize=64
 
@@ -1097,7 +1099,7 @@ AI   ≈ 147M / 3M ≈ 49 FLOP/Byte (理论)
 | 优化项 | 改法 | 直击根因 | 收益 | 可行性 |
 |--------|------|---------|:----:|:------:|
 | **P1 head 聚合后单次散射** | 64 head 的 dK/dV 在 UB/L1 先 reduce 成 1 份再 scatter | 根因二(原子×64) | 原子写 64→1，反向 dK/dV 段大降 | **中高**（改 kernel，UB 容量是约束） |
-| **P2 确定性散射** | `ScatterAddDeter`（workspace 规约）替代 `SetAtomicAdd` | 根因二(原子串行) | 去原子竞争 | **高**（已实现，切开关） |
+| **P2 确定性散射** | 参考通用代理算子的 `ScatterAddDeter`，以 workspace 规约替代 `SetAtomicAdd` | 根因二(原子串行) | 去原子竞争 | **中**（生产 SharedKVGrad 需确认或移植） |
 | **P3 bf16 散射/workspace** | dK/dV 中间量 fp32→bf16 | 根因二(访存量) | scatter 访存减半 | **中**（精度需对齐 loss） |
 | **P4 M 维填充：相邻 query 共享选中集** | 对相邻 query 做 topk 集合并/对齐，使多 query 能进同一 M 块 | 根因一(M=64) | 提 Cube 利用率，潜在最大收益 | **低中**（改算法语义，需精度验证） |
 | **P5 Gather 合并度提升** | 强化 pair-merge/block 选取粒度，提升连续搬运比例 | 根因二(随机访存) | 提带宽利用率 | **中** |
@@ -1113,4 +1115,1355 @@ AI   ≈ 147M / 3M ≈ 49 FLOP/Byte (理论)
 
 ### 10.7 一句话结论
 
-Top1/Top2 同根：**稀疏 + 逐 query 选择 → matmul M 维被压到 gSize=64（Cube 半载）+ 大量按 topk 索引的随机 gather/scatter + fp32 原子累加（MQA 下 ×64 竞争）**。所以是"访存 bound、MAC 低"。优化主轴是**减少/合并随机访存 + 去 fp32 原子 + 提 M 维填充**，而不是优化算力。零成本先切 `ScatterAddDeter`，高收益做 head 聚合后单次散射。
+Top1/Top2 同根：**稀疏 + 逐 query 选择 → matmul M 维被压到 gSize=64（Cube 半载）+ 大量按 topk 索引的随机 gather/scatter + fp32 原子累加（MQA 下 ×64 竞争）**。所以是"访存 bound、MAC 低"。优化主轴是**减少/合并随机访存 + 去 fp32 原子 + 提 M 维填充**，而不是优化算力。`ScatterAddDeter` 是通用代理算子中可见的实现，生产 SharedKVGrad 是否存在同名开关仍需以对应 CANN 版本为准；SharedKV 的实际开源旁证与梯度合并过程见下一章。
+
+---
+
+## 十一、`SparseAttnSharedKV` 正向与反向 Grad 逐行导读（新手版）
+
+> 本章目标不是只给结论，而是建立一套“以后可以自己读 NPU 算子”的方法：先看数学，再看 PyTorch autograd 封装，再看 ACLNN bridge，最后进入 AscendC 的 Cube、Vector、搬运与同步。
+
+### 11.0 先说明源码边界：哪些是实锤，哪些是旁证
+
+| 可信级别 | 内容 | 是否能逐行确认 |
+|---|---|:---:|
+| A | MindSpeed Python `SparseAttnSharedKV.forward/backward` | 是 |
+| A | MindSpeed C++ 对 `aclnnSparseAttnSharedkv`、`aclnnSparseAttnSharedkvGrad` 的调用 | 是 |
+| A | `ops-transformer/experimental/attention/sparse_attn_sharedkv` 正向 AscendC 内核 | 是 |
+| B | `ops-transformer/attention/sparse_flash_mla_grad` 的 Shared-KV/MLA 反向内核 | 是，但算子名不同，是高度接近的结构旁证 |
+| C | 生产环境中 `aclnnSparseAttnSharedkvGrad` 二进制内部的精确 tiling 和指令顺序 | 否，当前检出没有对应源码 |
+
+因此下面采用两种标记：
+
+- **源码事实**：可以指到当前仓库中的具体文件和行。
+- **实现推断**：由严格梯度公式及 `SparseFlashMlaGrad` 旁证得到，但不能声称是生产二进制的逐字实现。
+
+还有一个版本差异需要留意：
+
+- `SparseAttnSharedkv/README.md:77` 仍写着“不支持返回 LSE”。
+- 当前正向内核已经有 `ProcessLse()`，MindSpeed 训练封装也明确传入 `returnSoftmaxLse=True`。
+- 这说明 README 与训练集成所使用的 CANN/源码版本不同步。分析训练路径时，应以实际封装和内核代码为准。
+
+### 11.1 先用一句数学公式理解 SharedKV
+
+对一个 query 位置和一个 KV head，令：
+
+- $Q\in\mathbb{R}^{G\times D}$：同组的 query heads，DeepSeek4 中 $G=64$、$D=512$。
+- $X\in\mathbb{R}^{L\times D}$：当前 query 真正选中的 KV。
+- $X$ 同时充当 K 和 V，这就是 **SharedKV**。
+- $s\in\mathbb{R}^{G}$：每个 query head 的 attention sink logit。
+
+正向计算是：
+
+$$
+Z = scale\cdot QX^T
+$$
+
+$$
+LSE_i=\log\left(e^{s_i}+\sum_j e^{Z_{ij}}\right)
+$$
+
+$$
+P_{ij}=e^{Z_{ij}-LSE_i}
+$$
+
+$$
+O=PX
+$$
+
+这里最容易误解的地方有两个：
+
+1. **K 和 V 是同一个张量 $X$**，不是常规 Attention 中独立的 K、V。
+2. sink 只进入 softmax 分母，没有对应的 value，因此输出仍是 $PX$，不会再加一个 `p_sink * V_sink`。
+
+`X` 不是完整序列，而是两部分拼接：
+
+$$
+X = concat(X_{ori-window}, X_{cmp-selected})
+$$
+
+- `ori_kv`：当前 query 附近的滑动窗口，默认过去 127 个加当前 token，共最多 128 个。
+- `cmp_kv`：压缩后的 KV。
+- 当 `cmp_ratio=4` 时，按 `cmp_sparse_indices` 为每个 query 选 top-k，通常 512 个。
+- 当 `cmp_ratio=128` 时，不走 top-k 稀疏 gather，而是使用 causal 范围内的压缩 KV。
+
+### 11.2 训练调用链全景
+
+```mermaid
+flowchart TD
+    A["G2Attention.forward<br/>Q、ori_kv、cmp_kv、topk、sinks"] --> B["npu_sparse_attn_shared_kv<br/>整理 shape 和 layout"]
+    B --> C["SparseAttnSharedKV.forward<br/>PyTorch autograd.Function"]
+    C --> D["Metadata ACLNN<br/>生成 1024 个 int32 分核信息"]
+    C --> E["Forward ACLNN<br/>aclnnSparseAttnSharedkv"]
+    E --> F["AscendC 正向<br/>Vec0 gather -> MM1 -> Vec1 softmax -> MM2 -> Vec2"]
+    F --> G["返回 output + softmax_lse"]
+    G --> H["ctx 保存 Q、KV、O、LSE、indices、sinks"]
+    H --> I["上游反传 grad_output=dO"]
+    I --> J["SparseAttnSharedKV.backward"]
+    J --> K["aclnnSparseAttnSharedkvGrad"]
+    K --> L["dQ、dOriKV、dCmpKV、dSinks"]
+```
+
+源码入口：
+
+| 层次 | 文件 |
+|---|---|
+| 模型调用 | `MindSpeed-LLM/mindspeed_llm/tasks/models/transformer/deepseek4/g2_attention.py:234-260` |
+| Python autograd | `MindSpeed/mindspeed/ops/npu_sparse_attn_shared_kv.py:8-126` |
+| C++ ACLNN bridge | `MindSpeed/mindspeed/ops/csrc/cann/npu_sparse_attn_shared_kv.cpp:9-110` |
+| 正向入口 | `ops-transformer/experimental/attention/sparse_attn_sharedkv/op_kernel/sparse_attn_sharedkv.cpp:27-72` |
+| 正向主流水 | `.../arch22/sparse_attn_sharedkv_scfa_kernel.h` |
+| 正向 Cube | `.../arch22/sparse_attn_sharedkv_scfa_block_cube.h` |
+| 正向 Vector | `.../arch22/sparse_attn_sharedkv_scfa_block_vector.h` |
+| 反向结构旁证 | `ops-transformer/attention/sparse_flash_mla_grad/op_kernel/arch22/` |
+
+### 11.3 新手必须先懂的 AscendC 术语
+
+| 术语 | 可以先理解成 | 在本算子中的职责 |
+|---|---|---|
+| GM | NPU 全局显存/HBM | 放输入、输出和大 workspace |
+| UB | Vector 核的片上小缓存 | softmax、mask、cast、逐元素运算 |
+| L1 | Cube 前的片上缓存 | 暂存矩阵块 |
+| L0A/L0B | Cube 左、右矩阵缓存 | 喂给矩阵乘单元 |
+| L0C | Cube 累加结果缓存 | 保存 fp32 GEMM 累加值 |
+| AIC/Cube | 矩阵乘核心 | 做 `QK^T`、`PV` 及反向的五个矩阵乘 |
+| AIV/Vector | 向量核心 | gather、softmax、mask、归一化、scatter |
+| MTE2 | GM 到片上搬运 | 读输入/workspace |
+| MTE3 | 片上到 GM 搬运 | 写输出/workspace |
+| `SetFlag/WaitFlag` | 生产者-消费者信号量 | 防止 Cube 和 Vector 读到尚未准备好的数据 |
+| tiling | 把大矩阵切成硬件能处理的小块 | 决定每核处理的 B、S1、S2、head 范围 |
+
+正向入口中的：
+
+```cpp
+KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+```
+
+表示混合任务采用 **1 个 AIC 搭配 2 个 AIV**。代码中也能看到：
+
+- AIC block：`0-23`
+- AIV block：`0-47`
+- `aiCoreIdx = vectorBlockIdx / 2`
+
+也就是两个 Vector 核服务同一个 Cube 核，通常沿 M 方向各处理一部分行。
+
+### 11.4 Python 包装层逐行解释
+
+#### 11.4.1 外层便利函数：把模型张量整理成算子张量
+
+对应 `npu_sparse_attn_shared_kv.py:108-126`。
+
+```python
+cu_seq_lens_q = cu_seq_lens_ori_kv = cu_seq_lens_cmp_kv = None
+```
+
+- 这条便利路径不支持 TND packed sequence。
+- 本次训练传普通稠密 BSND 布局，因此 sequence length 辅助张量均为 `None`。
+
+```python
+ori_sparse_indices = None
+```
+
+- `ori_kv` 不做离散 top-k。
+- 它使用连续 sliding window，因此只需窗口左右边界。
+
+```python
+max_seq_len_q, batch_size, num_heads_q, head_dim = query.size()
+```
+
+- 此时模型传入的 query 还是 `[S, B, N, D]`。
+- 典型值是 `[4096, B, 64, 512]`。
+
+```python
+num_heads_kv = 1
+```
+
+- KV 只有一个 head。
+- 64 个 query heads 共享它，所以 $G=N_q/N_{kv}=64$。
+
+```python
+topk = 0 if cmp_ratio != 4 else cmp_sparse_indices.size(-1)
+```
+
+- `cmp_ratio=4` 是 SCFA，使用稀疏 top-k。
+- 其他压缩率走连续 compressed attention，不需要 top-k 索引。
+
+```python
+layout_q = layout_kv = 'BSND'
+```
+
+- 告诉底层每个维度是什么。
+- 注意，这里是“整理后的布局”，不是传入便利函数时的原布局。
+
+```python
+query = query.permute(1, 0, 2, 3).contiguous()
+```
+
+- `[S,B,N,D] -> [B,S,N,D]`。
+- `contiguous()` 很重要，因为底层根据 stride/连续地址搬运。
+
+```python
+ori_kv = ori_kv.permute(1, 0, 2).unsqueeze(2).contiguous()
+```
+
+- `[S,B,D] -> [B,S,1,D]`。
+- `unsqueeze(2)` 明确补出 `Nkv=1`。
+
+```python
+cmp_sparse_indices = cmp_sparse_indices.unsqueeze(2).contiguous()
+```
+
+- `[B,S,K] -> [B,S,1,K]`。
+- 这个 `1` 同样是 KV head 维。
+
+最后：
+
+```python
+output = SparseAttnSharedKV.apply(...)
+return output.transpose(0, 1).contiguous()
+```
+
+- `apply()` 进入自定义 autograd。
+- 算子返回 `[B,S,N,D]`，再转回模型使用的 `[S,B,N,D]`。
+
+#### 11.4.2 `forward()`：为什么先算 metadata
+
+对应 `npu_sparse_attn_shared_kv.py:10-76`。
+
+```python
+op = op_builder.load()
+```
+
+- JIT 加载 MindSpeed C++ 扩展。
+- Python 本身不做注意力计算，只负责调度。
+
+```python
+metadata = op.npu_sparse_attn_shared_kv_metadata(...)
+```
+
+- metadata 是长度 1024 的 int32 张量。
+- 它记录每个 AI Core 应处理的 B/N2、M、S2 起止位置。
+- 先在 host/AICPU 侧分好任务，设备内核就不需要每次动态抢任务。
+
+传给 metadata 的空 tensor：
+
+```python
+torch.tensor([]).npu()  # sequsedOriKv / sequsedCmpKv / sequsedQ / sequsedKv
+```
+
+- 是为推理接口保留的参数槽。
+- 当前训练路径不用，但 ACLNN 函数签名固定，仍需占位。
+
+真正的正向调用：
+
+```python
+result, softmax_lse = op.npu_sparse_attn_shared_kv(...)
+```
+
+关键参数：
+
+- `query/ori_kv/cmp_kv`：参与计算的数据。
+- `cmp_sparse_indices`：压缩 KV 的离散选择。
+- `sinks`：每个 Q head 一个 sink logit。
+- `metadata`：分核结果。
+- `softmax_scale`：通常 $1/\sqrt{512}$。
+- `ori_mask_mode=4`：sliding window。
+- `cmp_mask_mode=3`：compressed causal。
+- `returnSoftmaxLse=True`：训练反向必须使用。
+
+保存反向上下文：
+
+```python
+ctx.save_for_backward(
+    query, ori_kv, cmp_kv, result, softmax_lse,
+    ori_sparse_indices, cmp_sparse_indices,
+    cu_seq_lens_q, cu_seq_lens_ori_kv, cu_seq_lens_cmp_kv,
+    sinks
+)
+```
+
+其中最值得注意的是保存了 `result=O` 和 `softmax_lse=LSE`：
+
+- 不保存完整注意力矩阵 P，节省 $O(S\times K)$ 显存。
+- 反向用 `Q、KV、LSE` 重算 P。
+- 反向用 `O` 快速计算 $\delta=\sum_d dO_d\cdot O_d$。
+
+标量属性不能放进 `save_for_backward`，所以单独挂在 `ctx`：
+
+```python
+ctx.softmax_scale = softmax_scale
+ctx.cmp_ratio = cmp_ratio
+...
+```
+
+最后只返回 `result`，LSE 对用户不可见，但已保存在 ctx 中供 backward 使用。
+
+### 11.5 C++ bridge 逐行解释
+
+#### 11.5.1 metadata bridge
+
+对应 `npu_sparse_attn_shared_kv.cpp:9-23`。
+
+```cpp
+at::Tensor metadata = at::empty(
+    1024,
+    at::TensorOptions(...).dtype(at::kInt)
+);
+```
+
+- 在 NPU 上分配 1024 个 int32。
+- 这里只分配内存，内容由 ACLNN metadata 算子填充。
+
+```cpp
+ACLNN_CMD(aclnnSparseAttnSharedkvMetadata, ..., metadata);
+```
+
+- `ACLNN_CMD` 封装了 workspace 查询、executor 创建、stream 上执行等标准 ACLNN 流程。
+- C++ bridge 的作用类似“参数适配器”，不是实际算子。
+
+#### 11.5.2 forward bridge
+
+对应 `npu_sparse_attn_shared_kv.cpp:25-64`。
+
+```cpp
+at::Tensor attnOutput = at::empty(query.sizes(), query.options());
+```
+
+- 输出 shape 和 query 完全相同。
+- 这也再次证明 SharedKV 的输出 D 是 512，不是模型配置中另一个 `v_head_dim=128`。
+
+```cpp
+lse_sizes.back() = 1;
+softmaxLseOut = at::empty(lse_sizes, ...Float);
+```
+
+- LSE 只需要每个 `[B,S,N]` 一项。
+- shape 是 `[B,S,N,1]`，dtype 为 fp32。
+
+```cpp
+ori_kv_stride = tmp_kv.stride(0);
+cmp_kv_stride = tmp_kv.stride(0);
+```
+
+- 把 batch 维 stride 传给 ACLNN。
+- 设备端据此计算不同 batch 的起始地址。
+
+```cpp
+ACLNN_CMD(aclnnSparseAttnSharedkv, ..., attnOutput, softmaxLseOut);
+```
+
+- 到这里才进入 CANN 算子。
+- `attnOutput` 和 `softmaxLseOut` 是预分配输出。
+
+#### 11.5.3 backward bridge
+
+对应 `npu_sparse_attn_shared_kv.cpp:66-103`。
+
+```cpp
+const at::Tensor &cmpKv = cmpKvOptional.value_or(at::Tensor());
+```
+
+- 把 C++ optional 统一转换成 Tensor。
+- 没有该输入时使用 undefined/empty Tensor，便于 ACLNN 宏统一处理。
+
+```cpp
+at::Tensor dQuery = at::empty(query.sizes(), query.options());
+at::Tensor dOriKv = at::empty(oriKv.sizes(), oriKv.options());
+at::Tensor dSinks = at::empty(sinks.sizes(), sinks.options());
+```
+
+- 梯度 shape 与对应输入相同。
+
+```cpp
+if (cmpRatio > 1) {
+    dCmpKv = at::empty(cmpKv.sizes(), cmpKv.options());
+}
+```
+
+- 只有存在 compressed KV 的场景才分配 `dCmpKv`。
+
+```cpp
+ACLNN_CMD(aclnnSparseAttnSharedkvGrad,
+    query, oriKv, cmpKv, dOut, out, lse,
+    oriSparseIndices, cmpSparseIndices,
+    ..., sinks, scaleValue, ...,
+    dQuery, dOriKv, dCmpKv, dSinks);
+```
+
+反向输入可以分成四组：
+
+1. 重算 P：`query、oriKv、cmpKv、indices、mask、scale、lse`
+2. 计算 softmax 梯度：`dOut、out`
+3. 计算 sink 梯度：`sinks、lse、dOut、out`
+4. 输出：`dQuery、dOriKv、dCmpKv、dSinks`
+
+### 11.6 正向 AscendC：从入口到流水线
+
+#### 11.6.1 内核入口只做三件事
+
+`sparse_attn_sharedkv.cpp:27-72` 的宏可以压缩理解为：
+
+```cpp
+GET_TILING_DATA_WITH_STRUCT(...);
+op.Init(...);
+op.Process();
+```
+
+1. 读取 host 侧生成的 tiling。
+2. 绑定所有 GM 地址、workspace、片上 buffer。
+3. 执行主循环。
+
+模板按 dtype 和模式选择：
+
+- fp16 或 bf16。
+- `SCFA_TEMPLATE`：包含 sparse compressed gather。
+- `SWA_TEMPLATE`：连续 sliding/compressed 场景。
+
+#### 11.6.2 `InitTilingData()`：把 tiling 变成内核常量
+
+`sparse_attn_sharedkv_scfa_kernel.h:191-237`：
+
+```cpp
+constInfo.qHeadNum = constInfo.gSize =
+    tilingData->baseParams.nNumOfQInOneGroup;
+```
+
+- `gSize=64`。
+- 内核把同一个 KV head 对应的 64 个 query heads 当作 M 维。
+
+```cpp
+constInfo.kvHeadNum = 1;
+constInfo.headDim = 512;
+```
+
+- 当前模板明确固定 SharedKV 的关键维度。
+
+```cpp
+constInfo.mBaseSize = constInfo.gSize;
+constInfo.s2BaseSize = tilingData->baseParams.s2BaseSize;
+```
+
+- M 基本块是一组 query heads。
+- S2 按 tiling 给出的长度分块。
+
+#### 11.6.3 `Init()`：建立 GM 和 workspace 地图
+
+`sparse_attn_sharedkv_scfa_kernel.h:390-494`。
+
+输入输出 GM：
+
+```text
+queryGm        Q
+oriKvGm        原始滑窗 KV
+cmpKvGm        压缩 KV
+sinksGm        sink logits
+attentionOutGm O
+softmaxLseGm   LSE
+topKGm         compressed top-k indices
+```
+
+workspace：
+
+```text
+mm1ResGm   : QK^T 的 fp32 结果
+vec1ResGm  : softmax 后、cast 回 fp16/bf16 的 P
+mm2ResGm   : P@KV 的 fp32 tile 结果
+vec2ResGm  : 跨 S2 tile 的未归一化输出累加
+kvMergeGm  : 按 top-k gather 后的连续 compressed KV
+```
+
+为什么要有 `kvMergeGm`：
+
+- top-k 对应的 `cmp_kv` 地址不连续。
+- Cube 更擅长读取规则矩阵，不能高效地边做 MM 边随机索引。
+- 所以 Vector 先 gather 成连续矩阵，再交给 Cube。
+- 代价是多一次 `cmpKv GM -> UB -> kvMerge GM -> L1` 往返。
+
+#### 11.6.4 `ProcessBalance()`：每个核到底算哪些 query
+
+`sparse_attn_sharedkv_scfa_kernel.h:669-780`。
+
+metadata 提供：
+
+```text
+bN2Start / bN2End : batch × KV-head 范围
+gS1Start / gS1End : 展平后的 query/head 范围
+s2Start / s2End   : KV tile 范围
+```
+
+滑窗边界：
+
+```cpp
+oriMaskRight = actOriS2 - actS1 + s1End + oriWinRight;
+oriMaskLeft  = max(
+    actOriS2 - actS1 + s1End - oriWinLeft,
+    0
+);
+```
+
+当 Q/KV 序列等长、`oriWinLeft=127`、`oriWinRight=0` 时，可直观理解为：
+
+```text
+当前 query 位置 i 可看 ori_kv[max(0, i-127) : i+1]
+```
+
+随后分别计算：
+
+- `oriSplitNum`：滑窗 KV 需要几个 S2 tile。
+- `cmpSplitNum`：compressed selected KV 需要几个 S2 tile。
+- `s2SplitNum = oriSplitNum + cmpSplitNum`。
+
+#### 11.6.5 `PreloadPipeline()`：正向的核心流水
+
+`sparse_attn_sharedkv_scfa_kernel.h:783-825`。
+
+```mermaid
+sequenceDiagram
+    participant V0 as "AIV Vec0"
+    participant C1 as "AIC MM1"
+    participant V1 as "AIV Vec1"
+    participant C2 as "AIC MM2"
+    participant V2 as "AIV Vec2"
+
+    V0->>V0: "按 top-k gather cmp_kv"
+    V0-->>C1: "SYNC_V0_C1"
+    C1->>C1: "Q @ X_tile^T"
+    C1-->>V1: "SYNC_C1_V1"
+    V1->>V1: "scale + mask + online softmax"
+    V1-->>C2: "SYNC_V1_C2"
+    C2->>C2: "P_tile @ X_tile"
+    C2-->>V2: "SYNC_C2_V2"
+    V2->>V2: "跨 tile 修正并累计 O"
+```
+
+它不是完成一个 tile 后才开始下一个 tile，而是用环形 `extraInfo[3]` 交错执行：
+
+- 当前 tile 做 gather/MM1。
+- 更早的 tile 做 softmax/MM2。
+- 再早的 tile 做输出累计。
+
+这就是软件流水，目的是让 Cube、Vector 和搬运尽量同时忙碌。
+
+### 11.7 正向每个阶段逐行解释
+
+#### 11.7.1 Vec0：按索引 gather compressed KV
+
+`sparse_attn_sharedkv_scfa_block_vector.h:519-706`。
+
+```cpp
+realS2Idx = topkGm_.GetValue(topkBase + topkIdx);
+```
+
+- 从 top-k 张量读出真实 compressed KV token 下标。
+- `-1` 或超过 causal 上限的下标视为无效。
+
+```cpp
+keyOffset = GetKeyGmOffset(realS2Idx, ...);
+```
+
+- 根据 BSND、TND 或 PageAttention 布局，把逻辑 token 下标换成 GM 地址。
+
+```cpp
+CopyInKv(..., realS2Idx1, realS2Idx2, ...);
+```
+
+- 一次尝试处理两个索引。
+- 两块地址顺序合法且 stride 可表示时，用一次 `DataCopyPad(blockCount=2)`。
+- 否则退化为两次 `CopyInSingleKv()`。
+
+```cpp
+DataCopyPad(kvMergeGm_, kvMergUb_, ...);
+```
+
+- 把 UB 中聚合好的 KV 写入连续 workspace。
+- 后续两个 Cube matmul 都复用该 KV。
+
+#### 11.7.2 Cube MM1：`Q @ X_tile^T`
+
+`sparse_attn_sharedkv_scfa_block_cube.h:330-567`。
+
+关键切分常量：
+
+```cpp
+M_SPLIT_SIZE = 128;
+N_SPLIT_SIZE = 128;
+K_L1_SPLIT_SIZE = 256;
+K_L0_SPLIT_SIZE = 128;
+D_SPLIT_SIZE = 256;
+```
+
+实际 D=512，所以：
+
+- L1 的 K 维循环 2 次，每次 256。
+- 每个 256 再切两个 128 送入 L0。
+- `Mmad` 在 L0C 中累加 fp32。
+
+原始滑窗 KV：
+
+- BSND 下可按连续窗口直接 `DataCopy`。
+
+压缩稀疏 KV：
+
+- 从 Vec0 已整理好的 `kvMergeGm` 读取。
+
+最终：
+
+```cpp
+Fixpipe(mm1ResGm[...], cL0Tensor, fixParams);
+```
+
+- 把 L0C 中的 fp32 `QK^T` 写到 GM workspace。
+- Vector 核随后读取它做 softmax。
+
+#### 11.7.3 Vec1：scale、sink、online softmax、LSE
+
+`sparse_attn_sharedkv_scfa_block_vector.h:314-486`。
+
+先复制并广播 sinks：
+
+```cpp
+DataCopyPad(sinksUb, sinksGm, ...);
+Brcb(sinksBrcbUb, sinksUb, ...);
+```
+
+- `sinks` 原 shape 只有 `[Nq]`。
+- 广播后可与每个 query/head 行的 softmax 状态对齐。
+
+softmax 初始状态：
+
+```cpp
+softmaxSumDefault = 1;
+softmaxMaxDefault = sink;
+```
+
+含义是还没有处理任何 KV tile 时，分母中已经有：
+
+$$
+e^{sink-sink}=1
+$$
+
+读取 MM1 并缩放：
+
+```cpp
+DataCopy(mmResUb, mm1ResGm, ...);
+Muls(mmResUb, mmResUb, softmaxScale, ...);
+```
+
+在线 softmax：
+
+```cpp
+SoftmaxFlashV2(
+    logits,
+    newSum,
+    newMax,
+    probabilities,
+    expCorrection,
+    oldSum,
+    oldMax,
+    ...
+);
+```
+
+它维护三类状态：
+
+- `max`：到目前为止所有 tile 和 sink 的最大 logit。
+- `sum`：相对这个 max 的指数和。
+- `expCorrection = exp(oldMax-newMax)`：旧输出换到新 max 标尺的修正系数。
+
+概率 cast：
+
+```cpp
+Cast(tmpMMResCastTensor, mmResUb, CAST_ROUND, ...);
+DataCopy(vec1ResGm, tmpMMResCastTensor, ...);
+```
+
+- softmax 在 fp32 计算。
+- 给 MM2 的 P 转回 bf16/fp16，提高 Cube 吞吐。
+
+最后一个 S2 tile 写 LSE：
+
+```cpp
+Log(outLSE, sum);
+Add(outLSE, outLSE, max);
+```
+
+即：
+
+$$
+LSE=\log(sum)+max
+$$
+
+#### 11.7.4 Cube MM2：`P_tile @ X_tile`
+
+`sparse_attn_sharedkv_scfa_block_cube.h:570-850`。
+
+矩阵形状：
+
+```text
+P_tile : [M, S2_tile]
+X_tile : [S2_tile, 512]
+结果   : [M, 512]
+```
+
+这里再次从同一个 KV 读右矩阵，所以：
+
+- 在 MM1 中它是 K。
+- 在 MM2 中它是 V。
+- 这正是 SharedKV。
+
+S2 作为 K 维按 256/128 切分，输出 D=512 按 N=128 切分。
+
+#### 11.7.5 Vec2：跨 S2 tile 合并输出
+
+`sparse_attn_sharedkv_scfa_block_vector.h:878-953`。
+
+如果不是第一个 tile：
+
+```cpp
+oldOut *= exp(oldMax - newMax);
+newOut = currentPV + oldOut;
+```
+
+代码对应：
+
+```cpp
+RowMuls(bmm2ResPreUb, bmm2ResPreUb, expUb, ...);
+Add(bmm2ResUb, bmm2ResUb, bmm2ResPreUb, ...);
+```
+
+最后一个 tile：
+
+```cpp
+RowDivs(output, accumulatedPV, softmaxSum, ...);
+```
+
+得到最终归一化输出 $O$。
+
+非最后一个 tile 则把中间结果写回 `vec2ResGm`，供下一轮继续累计。
+
+### 11.8 backward Python：逐行看 autograd 如何接住梯度
+
+对应 `npu_sparse_attn_shared_kv.py:79-105`。
+
+```python
+def backward(ctx, grad_output):
+```
+
+- `grad_output` 就是上游传来的 $dO$。
+- shape 与 `result=O` 相同。
+
+```python
+query, ori_kv, cmp_kv, result, softmax_lse, ... = ctx.saved_tensors
+```
+
+- 取回正向保存的输入、输出和 LSE。
+- 没有保存 P，也没有保存完整 score。
+
+```python
+query_grad, ori_kv_grad, cmp_kv_grad, sinks_grad = \
+    op.npu_sparse_attn_shared_kv_grad(...)
+```
+
+- 一次 fused backward 返回所有可导张量的梯度。
+- indices、mask、layout、整数超参数都不可导。
+
+`backward()` 必须按 `forward()` 的 24 个参数原顺序返回 24 个槽位：
+
+| forward 参数位置 | 参数 | backward 返回 |
+|---:|---|---|
+| 1 | query | `query_grad` |
+| 2 | ori_kv | `ori_kv_grad` |
+| 3 | cmp_kv | `cmp_kv_grad` |
+| 4-8 | seq lens、ori/cmp indices | `None` |
+| 9 | sinks | `sinks_grad` |
+| 10-24 | scale、ratio、mask、窗口、shape、layout | `None` |
+
+这里的 `None` 不是“算漏了”，而是告诉 PyTorch：该输入不需要或不存在梯度。
+
+### 11.9 SharedKV 反向公式：一步一步推
+
+令上游梯度：
+
+$$
+G=dO
+$$
+
+#### 第一步：Value 路径对共享 KV 的梯度
+
+因为：
+
+$$
+O=PX
+$$
+
+所以把 X 暂时当作 V：
+
+$$
+dX_V=P^TG
+$$
+
+同时：
+
+$$
+dP=GX^T
+$$
+
+#### 第二步：softmax 梯度
+
+标准 softmax 每一行的梯度：
+
+$$
+dZ=P\odot(dP-\delta)
+$$
+
+其中：
+
+$$
+\delta=\sum_j P_jdP_j
+$$
+
+利用 $O=PX$，可以改写为：
+
+$$
+\delta=\sum_d G_d\cdot O_d
+$$
+
+这就是为什么 backward 输入里要带正向输出 `out`：
+
+- 直接逐元素计算 `dO * O` 再按 D reduce。
+- 不需要再用 P 和 dP 做一次额外行规约。
+
+#### 第三步：Query 梯度
+
+由于：
+
+$$
+Z=scale\cdot QX^T
+$$
+
+所以：
+
+$$
+dQ=scale\cdot dZX
+$$
+
+#### 第四步：Key 路径对共享 KV 的梯度
+
+把 X 暂时当作 K：
+
+$$
+dX_K=scale\cdot dZ^TQ
+$$
+
+#### 第五步：SharedKV 的关键合并
+
+同一个 X 同时走过 K 路径和 V 路径，因此：
+
+$$
+\boxed{dX=dX_K+dX_V}
+$$
+
+即：
+
+$$
+\boxed{dX=scale\cdot dZ^TQ+P^TG}
+$$
+
+这正是 SharedKV 与普通 K/V 分离 Attention 的根本差别。
+
+#### 第六步：sink 梯度
+
+sink 概率：
+
+$$
+p_{sink}=e^{sink-LSE}
+$$
+
+sink 没有 value，等价于该位置的 $dP_{sink}=0$，因此：
+
+$$
+\boxed{dSink=-p_{sink}\cdot\delta}
+$$
+
+再对 batch 和 query 位置累加到每个 head 的 sink 参数。
+
+本章使用一个无第三方依赖的有限差分小例子验证了整组公式：
+
+```text
+max finite-difference error = 6.472e-11
+dX = value-path + key-path 通过
+dSink = -p_sink * sum(dO * O) 通过
+```
+
+### 11.10 用 `SparseFlashMlaGrad` 旁证实际反向流水
+
+`SparseFlashMlaGrad/README.md:20-65` 给出的公式与上节完全一致：
+
+```text
+selectedKv = concat(oriKv, Gather(cmpKv, topkIndices))
+P          = exp(scale * Q @ selectedKv^T - LSE)
+dP         = dO @ selectedKv^T
+dS         = P * (dP - SoftmaxGrad(dO, O))
+dQ         = dS @ selectedKv * scale
+dKV        = dS^T @ Q * scale + P^T @ dO
+```
+
+其 AscendC 内核把反向拆成五个 Cube：
+
+| Cube | 源码注释公式 | 数学意义 |
+|---|---|---|
+| Cube1 | `s = q * k^T` | 重算 logits |
+| Cube2 | `dp = dy * v^T` | 计算 dP |
+| Cube3 | `dq = ds * k` | 计算 dQ，scale 在 post 阶段乘 |
+| Cube4 | `dk = ds^T * q` | Key 路径 dKV |
+| Cube5 | `dv = p^T * dy` | Value 路径 dKV |
+
+`cube12Process()`：
+
+```cpp
+cube1Process(...);  // QK^T
+cube2Process(...);  // dO X^T
+```
+
+`VecOp::Process()`：
+
+```cpp
+CalRowsumAndSftCopyIn(...); // delta=sum(dO*O)，读取 LSE
+CalSoftmax(...);            // P=exp(scale*score-LSE)
+CalSoftmaxGrad(...);        // dS=P*(dP-delta)
+CalDsinks(...);             // dSink
+```
+
+`cube345Process()`：
+
+```cpp
+cube5Process(...); // P^T dO
+cube4Process(...); // dS^T Q
+cube3Process(...); // dS X
+```
+
+最后 `ScatterAdd()` 把 Key/Value 两条路径合并：
+
+```cpp
+Muls(dk, dk, scale);
+Add(dk, dk, dv);
+DataCopy(dOriKvOut or dCmpKvOut, dk);
+```
+
+这三行直接对应：
+
+$$
+dKV=scale\cdot dK+dV
+$$
+
+#### 11.10.1 `SparseFlashMlaGrad::Init()`：确认它确实是 SharedKV
+
+`smlag_basic.h:149-206`：
+
+```cpp
+dimDqk = tilingData->opInfo.D;
+dimDv = dimDqk;
+```
+
+这是非常关键的源码证据：
+
+- 普通 Attention 可能有 `Dqk != Dv`。
+- 这个反向模板直接令 `Dv=Dqk`。
+- Cube1/2/3/4/5 都围绕同一个 512 维 KV 工作。
+
+```cpp
+if ASCEND_IS_AIC {
+    cubeBlockIdx = GetBlockIdx();
+}
+if ASCEND_IS_AIV {
+    cubeBlockIdx = GetBlockIdx() / 2;
+    subBlockIdx = GetBlockIdx() % 2;
+}
+```
+
+- 一个 Cube 核对应两个 Vector 子核。
+- `subBlockIdx=0/1` 用来拆分 gather、scatter 或 M 方向处理。
+
+```cpp
+selectedBlockSize = tilingData->opInfo.selectedBlockSize;
+s1BasicSize = tilingData->splitCoreParams.s1BasicSize;
+```
+
+- `selectedBlockSize` 是每个稀疏索引代表多少个连续 token。
+- `s1BasicSize` 是当前核一次处理多少个 query 位置。
+
+#### 11.10.2 `Process()`：AIC 和 AIV 跑相同任务表
+
+`smlag_basic.h:209-295` 可分成三段。
+
+第一段，AIC 路径：
+
+```cpp
+if ASCEND_IS_AIC {
+    cubeOp.Init(...);
+    for each assigned query block:
+        for each KV head:
+            for each selected-KV tile:
+                UpdateGmOffset(task, loop);
+                CubeCompute(cubeOp);
+}
+```
+
+- `UpdateGmOffset()` 只计算本任务的 GM 地址和边界。
+- `CubeCompute()` 发起五个矩阵乘中的一部分。
+
+第二段，AIV 路径：
+
+```cpp
+if ASCEND_IS_AIV {
+    vecOp.Init(...);
+    for the same task order:
+        UpdateGmOffset(task, loop);
+        VecCompute(vecOp);
+}
+```
+
+- AIC 和 AIV 必须遍历完全相同的 task 顺序。
+- 它们靠 task 奇偶、ping-pong buffer 和跨核 flag 对齐。
+
+第三段，post：
+
+```cpp
+SparseFlashMlaGradPost opCast;
+opCast.Init(dq, d_ori_kv, d_cmp_kv, workspace, ...);
+opCast.Process();
+```
+
+- 主流水先把高精度梯度写进 fp32 workspace。
+- post 再做 scale、cast 和最终输出整理。
+- `post.h:183-196` 可见 dQ 在这里乘 `scaleValue` 后 cast 回输入 dtype。
+
+#### 11.10.3 `CubeCompute()`：为什么当前任务和上一任务交错
+
+`smlag_basic.h:298-312`：
+
+第一项任务只有前半段：
+
+```cpp
+cube12Process(current);
+signal Vector;
+```
+
+从第二项任务开始：
+
+```cpp
+cube12Process(current);  // 当前任务重算 score、计算 dP
+signal Vector(current);
+
+wait Vector(previous);   // 等上一任务的 dS、P 已写好
+cube345Process(previous);// 上一任务计算 dV、dK、dQ
+```
+
+这是一条两级流水：
+
+```text
+时间 T0: task0 Cube1/2
+时间 T1: task1 Cube1/2  || task0 Vector
+时间 T2: task2 Cube1/2  || task1 Vector || task0 Cube3/4/5
+```
+
+最后循环结束后，还要额外 flush 一次尚未完成的 `cube345Process(lastTask)`。
+
+#### 11.10.4 `VecCompute()`：夹在 Cube1/2 与 Cube3/4/5 中间
+
+`smlag_basic.h:315-324`：
+
+```cpp
+CrossCoreWaitFlag(VEC_WAIT_CUBE);
+vecOp.Process(current);
+CrossCoreSetFlag(CUBE_WAIT_VEC);
+mmPingPongIdx = 1 - mmPingPongIdx;
+```
+
+逐行含义：
+
+1. 等 Cube1/2 把 score 和 dP 写入 workspace。
+2. Vector 重算 P，计算 delta、dS、dSink。
+3. 通知 Cube：dS 和 P 已经准备好，可以做 Cube3/4/5。
+4. 切换 ping-pong buffer，让下一任务写另一块 workspace。
+
+这解释了反向中最重要的数据依赖：
+
+```text
+Cube1/2
+   ↓ score、dP
+Vector
+   ↓ P、dS
+Cube3/4/5
+```
+
+#### 11.10.5 反向完整执行图
+
+```mermaid
+flowchart LR
+    A["Q、selectedKV、dO、O、LSE"] --> B["Cube1<br/>score=QKV^T"]
+    A --> C["Cube2<br/>dP=dO KV^T"]
+    B --> D["Vector<br/>P=exp(scale*score-LSE)"]
+    A --> E["Vector<br/>delta=sum(dO*O)"]
+    C --> F["Vector<br/>dS=P*(dP-delta)"]
+    D --> F
+    E --> F
+    F --> G["Cube3<br/>dQ_raw=dS KV"]
+    F --> H["Cube4<br/>dK_raw=dS^T Q"]
+    D --> I["Cube5<br/>dV=P^T dO"]
+    G --> J["Post<br/>dQ=scale*dQ_raw"]
+    H --> K["Vector<br/>dKV=scale*dK_raw+dV"]
+    I --> K
+    K --> L["ScatterAdd<br/>回写 ori/cmp 原位置"]
+    D --> M["Vector<br/>dSink=-p_sink*delta"]
+```
+
+### 11.11 反向 Vector 关键代码逐行解释
+
+#### 11.11.1 `CalRowsumAndSftCopyIn()`：计算 delta
+
+`sparse_flash_mla_grad_vec_op.h:493-519`：
+
+```cpp
+DataCopyPad(attentionGrad, dO);
+DataCopyPad(attention, O);
+Cast(..., fp32);
+SoftmaxGradFront(rowSum, attentionGrad, attention, ...);
+```
+
+这里的 `SoftmaxGradFront` 负责得到每行：
+
+$$
+\delta=\sum_d dO_d\cdot O_d
+$$
+
+然后读取 LSE 并广播到每个 S2 元素。
+
+#### 11.11.2 `CalSoftmax()`：从 score 和 LSE 重算 P
+
+`sparse_flash_mla_grad_vec_op.h:558-647`：
+
+```cpp
+DataCopyPad(pTensor, mm1WorkspaceGm, ...);
+Muls(pTensor, pTensor, scaleValue, ...);
+Sub(pTensor, pTensor, lseTensor, ...);
+Exp(pTensor, pTensor, ...);
+```
+
+即：
+
+$$
+P=e^{scale\cdot score-LSE}
+$$
+
+不再执行一次完整 softmax reduce，因为 LSE 已经由正向保存。
+
+sink 概率同理：
+
+```cpp
+sinkTensor = exp(sinkTensor - lseTensor);
+```
+
+#### 11.11.3 `CalSoftmaxGrad()`：计算 dS
+
+`sparse_flash_mla_grad_vec_op.h:650-693`：
+
+```cpp
+dPTensor = mm2Workspace;       // dP
+dSinkSumTensor = dPTensor * P; // 为 dSink 准备 P*dP
+dPTensor -= rowSum;            // dP-delta
+pTensor *= dPTensor;           // dS=P*(dP-delta)
+```
+
+随后把 dS cast 到 T1，写入 `dsWorkspaceGm`，供 Cube3/4 使用。
+
+#### 11.11.4 `CalDsinks()`：为什么要原子加
+
+`sparse_flash_mla_grad_vec_op.h:695-729`：
+
+```cpp
+dSinkSumTensor *= sinkProbability;
+ReduceSum(...);
+dSink = -reducedValue;
+SetAtomicAdd<float>();
+DataCopyPad(dSinksGm, sinkTensor, ...);
+```
+
+- 每个 query 位置都会产生一份 dSink。
+- 最终参数只有 `[Nq]`，所以必须跨 S1/batch 累加。
+- 这里使用 fp32 atomic add 保证多个核可并发更新同一个 head。
+
+#### 11.11.5 `GatherKV()`：为什么随机访存昂贵
+
+`sparse_flash_mla_grad_vec_op.h:732-847`：
+
+- 从 `topkIndicesGm` 取真实 token 下标。
+- 尝试成对合并两个选中块。
+- GM 读到 UB gather buffer。
+- 再写到 `selectedKWorkspaceGm`。
+- Cube1、2、3 从连续 workspace 读取。
+
+收益是 Cube 输入规整；代价是额外 GM round-trip 和不连续 MTE2 访问。
+
+#### 11.11.6 `ScatterAdd()`：SharedKV 合并与热点
+
+`sparse_flash_mla_grad_vec_op.h:909-1008`：
+
+```cpp
+DataCopy(dkInUb, mm4ResWorkspaceGm, ...);
+Muls(dkInUb, dkInUb, scale);
+DataCopy(dvInUb, mm5ResWorkspaceGm, ...);
+Add(dkInUb, dkInUb, dvInUb, ...);
+```
+
+- `mm4` 是 Key 路径。
+- `mm5` 是 Value 路径。
+- 先给 dK 乘 scale，再与 dV 相加，得到最终 dKV。
+
+目标地址：
+
+```cpp
+isCmp ? topkIndices[index] : oriWinStart + localIndex
+```
+
+- ori 部分回写到连续滑窗位置。
+- cmp 部分按 top-k 索引散射。
+
+使用：
+
+```cpp
+SetAtomicAdd<float>();
+DataCopy(dOriKvOutGm or dCmpKvOutGm, ...);
+```
+
+原因：
+
+- 不同 query 的滑窗高度重叠。
+- 不同 query 的 top-k 可能选择同一个 compressed token。
+- 64 个 Q heads 共享同一个 KV head。
+- 多个核可能同时给同一 KV 行累加梯度。
+
+因此这里是反向最明显的写竞争热点。
+
+### 11.12 为什么反向需要五个矩阵乘
+
+对 SharedKV 来说，五个矩阵乘并非重复浪费，而是五个不同 Jacobian 方向：
+
+| 计算 | 目的 | 可否省掉 |
+|---|---|---|
+| `QX^T` | 重算 P | 除非正向保存巨大的 P，否则不能省 |
+| `dO X^T` | 得到 dP | 不能省 |
+| `dS X` | 得到 dQ | 不能省 |
+| `dS^T Q` | 得到 Key 路径 dX | 不能省 |
+| `P^T dO` | 得到 Value 路径 dX | 不能省 |
+
+可优化的是：
+
+- 五个 MM 如何切 tile、如何流水。
+- selected KV 是否重复落 GM workspace。
+- dK/dV 是否能在片上更早合并。
+- scatter 前能否先对相同 KV index 做局部归并。
+
+不能简单地因为 K=V 就删掉 Cube4 或 Cube5，因为“张量相同”不等于“梯度路径相同”。
+
+### 11.13 用一个小 shape 跟完整执行过程
+
+假设只看一个 batch、一个 query 位置：
+
+```text
+Q             [64, 512]
+ori window    [128, 512]
+cmp top-k     [512, 512]
+selected KV   [640, 512]
+score/P/dP/dS [64, 640]
+O/dO/dQ       [64, 512]
+dSelectedKV   [640, 512]
+```
+
+正向：
+
+```text
+1. gather cmp_kv[512个离散索引] -> 连续 [512,512]
+2. 与 ori window 拼成逻辑 selected KV [640,512]
+3. MM1: [64,512] x [512,640] -> score [64,640]
+4. 加 sink 做在线 softmax，保存 LSE [64]
+5. MM2: [64,640] x [640,512] -> O [64,512]
+```
+
+反向：
+
+```text
+1. 重算 score 和 P
+2. dP = [64,512] x [512,640] -> [64,640]
+3. delta = reduce(dO * O, D) -> [64]
+4. dS = P * (dP-delta) -> [64,640]
+5. dQ = [64,640] x [640,512] -> [64,512]
+6. dK = [640,64] x [64,512] -> [640,512]
+7. dV = [640,64] x [64,512] -> [640,512]
+8. dSelectedKV = scale*dK + dV
+9. 前128行累加回 ori_kv，后512行按 top-k scatter 回 cmp_kv
+10. dSink 对所有 query/batch 累加
+```
+
+### 11.14 性能瓶颈应该怎样正确理解
+
+#### 正向
+
+1. compressed KV top-k 是随机读。
+2. gather 后还要写 `kvMergeGm`，Cube 再读一次。
+3. QK 和 PV 的 D 都是 512。
+4. M 维主要是 64 个共享 KV 的 Q heads，小于常见 Cube base M=128。
+5. 在线 softmax 和跨 tile 累加需要 AIC/AIV 频繁同步。
+
+#### 反向
+
+1. 正向的 QK 必须重算。
+2. 共有五个 GEMM-like contraction，且 SharedKV 的 K/V 维都是 512。
+3. gather workspace 会被多次读取。
+4. dK/dV 先各自产生，再合并成 dKV。
+5. ori 窗口重叠和 cmp top-k 重复导致 scatter atomic 竞争。
+6. 64 个 query heads 对一个 KV head 汇聚梯度，进一步放大归约压力。
+
+#### 相对便宜的部分
+
+- `dSink` 只有每 head 一个标量输出。
+- mask/indices 本身不求导。
+- LSE 让 P 的重算不必再次做整行 max/sum reduce。
+
+### 11.15 阅读这类算子的推荐顺序
+
+对于初学者，不建议一上来从 1000 行 AscendC 模板顺读。更有效的顺序是：
+
+1. 从 README 或 golden 写出数学公式。
+2. 确认真实 shape，尤其是 head 数和 D。
+3. 看 Python autograd 保存了什么、返回了什么。
+4. 看 C++ bridge 分配了哪些输出。
+5. 从设备入口找到 `Init()` 和 `Process()`。
+6. 先只认出两类函数：搬运和计算。
+7. 给每个 workspace 标注“谁写、谁读”。
+8. 最后再看 ping-pong、event ID、对齐和尾块。
+
+本算子的最小心智模型可以记成：
+
+```text
+Forward:
+gather X -> QX^T -> online softmax(+sink) -> PX -> O/LSE
+
+Backward:
+recompute P -> dP -> dS -> dQ + dK + dV -> dKV -> scatter
+```
+
+### 11.16 本章结论
+
+1. `SparseAttnSharedKV` 的真实算子维度是 `K=V=D=512`，不能套用普通 MLA 中 V=128 的分析。
+2. 正向开源内核完整展示了 `Vec0 gather -> Cube MM1 -> Vec1 online softmax -> Cube MM2 -> Vec2 accumulate` 的 AIC/AIV 流水。
+3. 训练反向通过保存 `O` 和 `LSE`，避免保存完整 P，并在 backward 中重算 P。
+4. SharedKV 的梯度必须合并两条路径：
+
+   $$
+   dKV=scale\cdot dS^TQ+P^TdO
+   $$
+
+5. `dSink=-exp(sink-LSE)\cdot sum(dO*O)`，并跨 query/batch 累加。
+6. 当前仓库没有生产符号 `aclnnSparseAttnSharedkvGrad` 的精确内核源码；`SparseFlashMlaGrad` 是公式、输出和五 Cube 流程都高度一致的最佳开源旁证。
+7. 真正的性能热点不是某一条 `Mmad`，而是“小 M 的五个矩阵乘 + 随机 gather + fp32 atomic scatter + 共享 KV 归约”组合在一起。
