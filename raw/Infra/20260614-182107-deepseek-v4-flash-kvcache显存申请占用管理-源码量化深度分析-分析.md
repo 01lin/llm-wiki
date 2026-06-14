@@ -1,4 +1,4 @@
-# DeepSeek V4 Flash KV Cache：显存申请、实际占用与运行管理源码量化分析
+ # DeepSeek V4 Flash KV Cache：显存申请、实际占用与运行管理源码量化分析
 
 > 日期：2026-06-14  
 > Hugging Face 模型：[`deepseek-ai/DeepSeek-V4-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)  
@@ -46,15 +46,16 @@ DeepSeek V4 Flash 的每层注意力都保留最近 128 个 token 的滑动窗�
 | 口径 | 1M 上下文、单请求、单 rank | 含义 |
 |---|---:|---|
 | HF 参考连续缓存 | 6.735 GiB | 按参考实现连续张量与 BF16 索引缓存计算，不含 MTP |
-| vLLM Ascend 有效页面载荷 | 6.091 GiB | 实际属于该请求各缓存组的页面字节 |
-| vLLM Ascend 共享块池占用 | 6.639 GiB | 请求占用 block ID 后，被锁住的完整物理 slab |
-| 默认 A3 配方的准入峰值 | 12.166 GiB | `max-num-batched-tokens=10240` 时完整序列准入上界 |
+| vLLM Ascend 有效页面载荷 | 6.091-6.101 GiB | Decode step 完成后到下一 step 分配 slot 的相位区间 |
+| vLLM Ascend 共享块池占用 | 6.639-6.651 GiB | 2,119-2,123 个活动 block ID 锁住的完整物理 slab |
+| 910B3 本文配置的准入峰值 | 12.166 GiB | `max-num-batched-tokens=10240` 时完整序列准入上界 |
 
 因此：
 
 - INT8 索引缓存把**有效载荷**从参考实现的 6.735 GiB 降到约 6.091 GiB。
-- 共享 block ID 和异构页面组合使**真实块池占用**回升到约 6.639 GiB。
-- 大批次预填充又会为滑动窗口和状态缓存预留本批次临时页，使**准入峰值**达到约 12.166 GiB。
+- 共享 block ID 和异构页面组合使**真实块池占用**回升到约 6.639-6.651 GiB。
+- 大批次预填充会把滑动窗口和状态缓存的本批次临时页计入准入需求上界，使
+  **准入峰值**达到约 12.166 GiB；通过准入后仍只实际申请当前 chunk 的页面。
 
 所以“1M KV Cache 只占 6.1 GiB”只能描述稳定载荷，不能直接用于推导服务最大并发。
 
@@ -64,9 +65,9 @@ DeepSeek V4 Flash 的每层注意力都保留最近 128 个 token 的滑动窗�
 
 | 场景 | 每请求 block ID | 共享块池占用 | 32 GiB 池的静态上限 |
 |---|---:|---:|---:|
-| 135K 稳定解码，页边界对齐 | 280 | 0.877 GiB | 36 |
+| 135K 稳定解码，step 完成后低水位 | 280 | 0.877 GiB | 36 |
 | 133K 预填充准入，批次 8192 | 1688 | 5.289 GiB | 5 |
-| 1M 稳定解码，页边界对齐 | 2119 | 6.639 GiB | 4 |
+| 1M 稳定解码，step 完成后低水位 | 2119 | 6.639 GiB | 4 |
 | 1M 预填充准入，批次 10240 | 3883 | 12.166 GiB | 2 |
 
 该表还未扣除水位线、并发运行请求、投机 token、外部缓存临时块和设备 Graph 额外显存，因此是上限，不是服务承诺值。
@@ -251,6 +252,108 @@ vLLM Ascend 对 DeepSeek V4 约定：
 | C4 Indexer state | 8 | `512 × 4 = 2048` | 16,384 | 16,640 | 98.46% |
 | C128 Compressor state | 32 | `1024 × 4 = 4096` | 131,072 | 131,072 | 100% |
 
+这里最容易混淆的是 `512 × 2`。它不是“Key 512 维再加 Value 512 维”，而是：
+
+```text
+512
+  = config.head_dim
+  = DeepSeek V4 多头潜在注意力为每个 token 生成的一行共享压缩 KV 向量宽度
+
+2
+  = BF16 每个元素 2 bytes
+
+单行主压缩 KV
+  = 1 个共享 KV head × 512 元素 × 2 bytes
+  = 1024 bytes
+```
+
+DeepSeek V4 的 `wkv` 直接从 hidden state 投影到 `head_dim=512`，主缓存规格也是
+`num_kv_heads=1, head_size=512`。因此这 512 维是已经把 Key/Value 信息压进同一个潜在表示后的缓存行，不再按普通注意力的独立 K、V 两份张量计算：
+
+- `head_dim=config.head_dim`： [deepseek_v4.py:732](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/models/deepseek_v4.py:732)
+- `wkv: hidden_size -> head_dim`： [deepseek_v4.py:765](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/models/deepseek_v4.py:765)
+- 主压缩缓存使用一个 KV head： [layer.py:174](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/models/layer/attention/layer.py:174)
+
+#### `128` 为什么反复出现
+
+本文里至少有三种完全不同的 `128`，必须分开：
+
+| `128` 的位置 | 含义 | 来源 |
+|---|---|---|
+| `index_head_dim=128` | C4 索引 key 的向量宽度 | 模型配置 |
+| `block_size=128` | 主压缩缓存和 SWA 每页的行数 | vLLM 启动参数和页面表 |
+| `sliding_window=128` | 每层保留的最近原始 token 数 | 模型配置 |
+
+因此 C4 Index 单行：
+
+```text
+128 × 1 + 1 × 2
+  = 128 个 INT8 key 元素
+  + 1 个 FP16 scale
+  = 130 bytes
+```
+
+这里的第一项 `128` 是索引向量维度，不是页面行数；页面总大小再乘另一个
+`block_size=128`：
+
+```text
+128 rows × 130 bytes/row = 16,640 bytes
+```
+
+#### `2048` 为什么只出现在 C4 主状态
+
+`Compressor` 为每个状态位置同时保存：
+
+1. `kv_state`；
+2. `score_state`。
+
+C4 还使用重叠压缩，`coff=2`，即正常压缩通道和重叠通道各一份。因此：
+
+```text
+C4 主状态维度
+  = 2                  # kv_state + score_state
+    × coff(2)          # 普通通道 + 重叠通道
+    × head_dim(512)
+  = 2048 个 FP32 元素
+
+单行字节
+  = 2048 × 4
+  = 8192 bytes
+```
+
+源码直接使用 `state_dim=2 * self.coff * self.head_dim`：
+[deepseek_v4.py:645-653](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/models/deepseek_v4.py:645)。
+
+用户问题中的 `2040` 应为 `2048`。
+
+#### `1024` 为什么出现在 C128 状态
+
+C128 不使用 C4 的重叠通道，只有一份 `kv_state` 和一份 `score_state`：
+
+```text
+C128 主状态维度
+  = 2 × head_dim(512)
+  = 1024 个 FP32 元素
+
+单行字节
+  = 1024 × 4
+  = 4096 bytes
+```
+
+源码：[deepseek_v4.py:655-661](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/models/deepseek_v4.py:655)。
+
+#### C4 Indexer state 为什么又是 `512`
+
+Indexer 的输入宽度不是主压缩缓存的 512，而是 `index_head_dim=128`。它同样使用：
+
+```text
+2 种 state × 2 个重叠通道 × 128
+  = 512 个 FP32 元素
+```
+
+所以单行 `512 × 4 = 2048 bytes`，8 行真实需要 16,384 bytes，最后放进
+16,640-byte 小页面。
+
 公式来自：
 
 - 通用 `AttentionSpec.page_size_bytes`： [kv_cache_interface.py:159-180](/Users/linyi/code/Documents/code/vllm/vllm/v1/kv_cache_interface.py:159)
@@ -259,7 +362,32 @@ vLLM Ascend 对 DeepSeek V4 约定：
 - C4/C128 state_dim： [deepseek_v4.py:645-662](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/models/deepseek_v4.py:645)
 - 状态窗口 8/128： [compressor.py:121-169](/Users/linyi/code/Documents/code/vllm/vllm/models/deepseek_v4/compressor.py:121)
 
-### 4.3 每页覆盖多少原始 token
+### 4.3 哪些缓存使用大页面，哪些使用小页面
+
+Ascend 910B3 在当前 vLLM Ascend 代码中归入 A2 设备路径：
+
+- SoC version `220..225 -> AscendDeviceType.A2`：
+  [utils.py:794-798](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/utils.py:794)
+- 非 A5 使用 A2/A3 页面表：
+  [layer.py:31-46](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/models/layer/attention/layer.py:31)
+
+`block_size=128` 时，页面映射为：
+
+| 缓存类型 | 真实大小 | 统一后的页面 | 原因 |
+|---|---:|---:|---|
+| C4 主压缩 KV | 131,072 B | **大页面 131,072 B** | 恰好装满 |
+| C128 主压缩 KV | 131,072 B | **大页面 131,072 B** | 恰好装满 |
+| SWA | 131,072 B | **大页面 131,072 B** | 恰好装满 |
+| MTP 的 SWA | 131,072 B | **大页面 131,072 B** | 与普通 SWA 相同 |
+| C4 主 Compressor state | 65,536 B | **大页面 131,072 B** | 规划器只使用 C4 Full 给出的两个标准页面，向上 padding |
+| C128 Compressor state | 131,072 B | **大页面 131,072 B** | 恰好装满 |
+| C4 Index key + scale | 16,640 B | **小页面 16,640 B** | 恰好装满 |
+| C4 Indexer state | 16,384 B | **小页面 16,640 B** | 向上 padding 256 B |
+
+这里的“大/小页面”是 DeepSeek V4 KV planner 的两种 canonical page size，
+不是操作系统的 2 MiB HugePage，也不是 NPU allocator 的 2 MiB 地址对齐。
+
+### 4.4 每页覆盖多少原始 token
 
 | 缓存类型 | 每页缓存行 | 压缩倍数 | 每页覆盖原始 token |
 |---|---:|---:|---:|
@@ -308,18 +436,82 @@ Ascend patch 先按压缩倍数和滑动窗口 block size 分组：
 | C4 State | 21 个大页 + 21 个小页 | 21 |
 | C128 State | 20 个大页 | 20 |
 
+为什么是 44 个 SWA 层：
+
+```text
+43 个主模型 decoder layer
+  + 1 个 MTP draft layer
+  = 44 个 SWA cache layer
+```
+
+43 个主层无论其压缩倍数是 0、4 还是 128，都会构造一个
+`AscendDeepseekV4SWACache`；MTP 使用一层 `DeepseekV2DecoderLayer`，其
+`config_layer_idx=43` 对应 `compress_ratio=0`，所以它只增加 SWA，不增加 C4/C128
+压缩历史和 Compressor state：
+
+- 每个 decoder layer 构造 SWA： [deepseek_v4.py:855-863](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/models/deepseek_v4.py:855)
+- MTP 构造完整 draft decoder layer： [deepseek_v4_mtp.py:88-95](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/models/deepseek_v4_mtp.py:88)
+
+“拆成两个 22 层 group”不是按模型语义人为二分，而是 planner 为了让不同页面类型能
+共享同一套全局 block ID 数量而做的 tuple 对齐。
+
 ### 5.2 规划器为什么产生 23 个 slot
 
-`_approximate_gcd()` 在 `[21, 20, 44, 21, 20]` 中选择 22，使总 padding 最小。随后：
+五类原始 tuple 数为：
+
+```text
+C4 Full       = 21
+C128 Full     = 20
+SWA           = 44
+C4 State      = 21
+C128 State    = 20
+```
+
+即 `_approximate_gcd()` 的输入为 `[21, 20, 44, 21, 20]`，搜索范围从
+`lower_bound=21` 到 44。它对候选 `d` 计算：
+
+```text
+padding(d)
+  = Σ ((d - x mod d) mod d)
+```
+
+几个关键候选：
+
+| 候选 tuple 大小 `d` | 五组 padding 分解 | 总 padding |
+|---:|---|---:|
+| 21 | `0 + 1 + 19 + 0 + 1` | 21 |
+| **22** | `1 + 2 + 0 + 1 + 2` | **6** |
+| 23 | `2 + 3 + 2 + 2 + 3` | 12 |
+| 24 | `3 + 4 + 4 + 3 + 4` | 18 |
+
+所以最优值是 22。源码会在 padding 相同时优先更大的 `d`，但这里 22 本身就是唯一最小值：
+[_approximate_gcd](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/kv_cache_utils.py:1469)。
+
+SWA 的拆分数：
+
+```text
+num_tuple_groups
+  = ceil(44 / 22)
+  = 2
+```
+
+实现不是简单切前 22/后 22，而是 `layer_tuples[i::2]` 交错取层；每个子组仍正好 22
+层。源码：[patch_kv_cache_utils.py:166-181](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/patch/platform/patch_kv_cache_utils.py:166)。
+
+接着进入物理布局 planner：
 
 - 非 MTP 的最长 bucket 为 22；
 - MTP 被从 bucket 中单独取出；
 - 最终 `num_layer_tuples = 22 + 1 = 23`。
 
-源码：
+为什么移除 MTP 后仍有一个长度为 22 的普通 bucket：
 
-- [_approximate_gcd](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/kv_cache_utils.py:1469)
-- [MTP 单独布局与 num_layer_tuples](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/patch/platform/patch_kv_cache_utils.py:204)
+- 一个 SWA 子组含 22 个普通主层；
+- 另一个 SWA 子组原本 22 层，其中 21 个主层加 1 个 MTP；
+- planner 把 MTP 单独移出后，这两个普通 SWA bucket 分别为 22 和 21；
+- 因此普通 bucket 的最大长度仍为 22，再额外加 1 个 MTP slot，得到 23。
+
+源码：[patch_kv_cache_utils.py:209-245](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/patch/platform/patch_kv_cache_utils.py:209)。
 
 规划器的每个全局 block 预算：
 
@@ -364,7 +556,49 @@ physical_slab
 = 0.98% planned_slab
 ```
 
-分配代码：[model_runner_v1.py:3929-4109](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:3929)
+Ascend NPU 上的真实创建过程是：
+
+1. planner 生成 44 个普通 `KVCacheTensor` 描述：
+   `22 × 2 种页面`；
+2. 再生成 1 个 MTP 大页描述；
+3. 但 `_allocate_kv_cache_tensors()` 对每个描述只遍历
+   `range(len(kv_cache_tensor.shared_by))`；
+4. 小页 tuple 21 的 `shared_by=[]`，因此不会执行 `torch.zeros()`；
+5. MTP 只有大页描述，不存在对应小页描述。
+
+所以 NPU 实际创建的是 44 个非空底层 storage：
+
+```text
+21 个小页面 tensor
+  + 22 个普通大页面 tensor
+  + 1 个 MTP 大页面 tensor
+  = 44 个底层 tensor
+```
+
+分配代码：[model_runner_v1.py:3929-3992](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:3929)。
+
+随后每个底层 raw INT8 storage 再按目标缓存类型 `view/as_strided` 成 BF16、FP32、
+INT8 和 FP16 scale 视图；`num_blocks` 由
+`raw_tensor.numel() // page_size_bytes` 校验：
+[model_runner_v1.py:4173-4225](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:4173)。
+
+#### 为什么 NPU 进程观测值还可能高于 3.208 MiB/block
+
+如果启用 `kv_transfer_config`，每个非空底层 tensor 会先申请：
+
+```text
+kv_cache_tensor.size + 2 MiB
+```
+
+然后把起始地址向 2 MiB 对齐并切片。44 个 storage 的“额外申请上界”为：
+
+```text
+44 × 2 MiB = 88 MiB
+```
+
+这 88 MiB 是每个 worker 的一次性地址对齐 storage 上界，不是每个 block 的开销；
+实际 `memory_allocated` 和 `memory_reserved` 还会受 PyTorch NPU allocator 分桶影响。
+未启用 KV transfer 时没有这层 `+2 MiB`。
 
 如果没有启用 MTP：
 
@@ -391,6 +625,184 @@ physical_slab
 | C128 State | 2,621,440 | 77.93% |
 
 这就是“块池使用率高，但有效载荷率仍可能只有 78% 至 92%”的来源。
+
+这里还需要区分“申请动作”和“物理池形状”：
+
+```text
+逻辑申请：
+  每个 group manager 独立判断自己需要多少 block ID，
+  C4 不够时只为 C4 group 申请，不会同时给六个 group 各申请一个。
+
+物理结果：
+  所有 manager 从同一个全局 BlockPool 取 ID。
+  ID=x 一旦被 C4 占用，x 就从全局 free queue 消失，
+  其他 group 不能再使用 x。
+  而启动阶段已经为 x 预留了全部 21 小页 + 23 大页的 slab。
+```
+
+因此：
+
+- **不是“一层申请一次 block”**；
+- C4 Full group 的一个 block ID 同时索引 21 层 C4 主压缩页和 21 层 C4 Index 页；
+- C4 State group 的一个 block ID同时索引 21 层主状态页和 21 层 Indexer 状态页；
+- 六个 group 分别申请 ID，但共享一个全局 ID 命名空间；
+- 这正是 group 只使用 slab 子集、其余页面被同一 ID 锁住的原因。
+
+源码：
+
+- coordinator 对各 manager 的需求求和：
+  [kv_cache_coordinator.py:129-180](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/kv_cache_coordinator.py:129)
+- 每个 manager 分别调用同一个 `block_pool.get_new_blocks()`：
+  [kv_cache_coordinator.py:214-239](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/kv_cache_coordinator.py:214)
+- 全局 free queue 出队后 ID 引用计数加一：
+  [block_pool.py:333-365](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/block_pool.py:333)
+
+### 5.5 MTP 开启后的权重、KV Cache 和临时 buffer 增量
+
+#### MTP 权重
+
+本文直接解析了官方 revision
+`553034d7dd9e06c2eeaee68cf85a17d6d4754cf0` 的 safetensors header。
+`mtp.0.*` 一共有 1,575 个张量：
+
+- 权重索引：
+  [model.safetensors.index.json](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/553034d7dd9e06c2eeaee68cf85a17d6d4754cf0/model.safetensors.index.json)
+- `mtp.0.*` 全部位于：
+  [model-00046-of-00046.safetensors](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/553034d7dd9e06c2eeaee68cf85a17d6d4754cf0/model-00046-of-00046.safetensors)
+
+| 组成 | 官方 checkpoint 字节 |
+|---|---:|
+| 256 个 routed experts 的 INT8 权重 | 3,221,225,472 B |
+| FP8 attention、e/h projection、shared expert 等 | 165,675,008 B |
+| FP8 block scale | 201,336,704 B |
+| BF16/F32 norm、gate、hc 参数等 | 5,550,572 B |
+| **`mtp.0.*` 合计** | **3,593,787,756 B = 3.347 GiB** |
+
+此外，MTP loader 会把主 checkpoint 的 `embed.weight` 映射到 draft embedding。
+DeepSeek V4 因 `use_compress=True` 不走 embedding 共享分支：
+[llm_base_proposer.py:340-403](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py:340)。
+
+官方 embedding 为：
+
+```text
+shape = 129,280 × 4,096
+dtype = BF16
+bytes = 1,059,061,760
+      = 0.986328 GiB
+```
+
+所以官方量化 checkpoint 口径下的全局 MTP 权重增量约：
+
+```text
+3.347 GiB MTP core
+  + 0.986 GiB 独立 embedding
+  = 4.333 GiB
+```
+
+语言模型输出头构造时会暂时有一份同样大小的参数，但 MTP 初始化后若与主模型
+`lm_head` 相同，会替换成主模型对象：
+[llm_base_proposer.py:410-447](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py:410)。
+因此它可能增加启动峰值和 allocator reserved memory，不应计入稳定 allocated 权重。
+
+如果把 MTP 语义权重全部按 BF16 展开，去掉 FP8 block scale、保留 F32 控制参数：
+
+```text
+MTP core BF16/F32
+  ≈ 6.314 GiB
+
+加独立 BF16 embedding
+  ≈ 7.300 GiB 全局权重
+```
+
+这仍不是单张 910B3 的驻留量。每卡实际值近似为：
+
+```text
+复制权重
+  + tensor-parallel 权重 / TP
+  + routed expert 权重 / expert-parallel
+  + embedding / TP
+  + 冗余专家副本
+```
+
+已知至少 `e_proj`、`h_proj` 是 `ReplicatedLinear`，BF16 下两者每卡固定约 64 MiB；
+其余 attention、MoE 和词表权重按各自 parallel layer/weight loader 切分：
+[deepseek_v4_mtp.py:64-95](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/models/deepseek_v4_mtp.py:64)、
+[deepseek_v4_mtp.py:252-330](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/models/deepseek_v4_mtp.py:252)。
+
+#### MTP KV Cache
+
+MTP 只新增一层 SWA，大页增量为：
+
+```text
+每个全局 block ID
+  + 131,072 B
+  = +0.125 MiB
+```
+
+planner 分母从：
+
+```text
+MTP off: 22 × (16,640 + 131,072) = 3,249,664 B
+MTP on : 23 × (16,640 + 131,072) = 3,397,376 B
+```
+
+固定 KV budget 下：
+
+```text
+num_blocks_on / num_blocks_off
+  ≈ 22 / 23
+  = 95.65%
+```
+
+即 MTP 仅从 planner 口径就会让可用全局 block 数下降约 4.35%。
+
+按物理 slab：
+
+```text
+MTP off = 21 × 16,640 + 22 × 131,072 = 3,233,024 B
+MTP on  = 21 × 16,640 + 23 × 131,072 = 3,364,096 B
+```
+
+1M 稳定 Decode 的 2,119 个 block ID 对应：
+
+```text
+MTP KV 结构增量
+  = 2,119 × 131,072
+  = 277,741,568 B
+  = 0.258667 GiB
+```
+
+这是 step 完成后的低水位。下一 step 的 2,123-ID 高水位会再增加
+`4 × 128 KiB = 0.5 MiB`，完整区间见第 7.4 节。
+
+注意 MTP 没有增加第七个 group，通常也不增加稳定阶段的 block ID 数；它增加的是
+**每一个已占用全局 ID 背后的 slab 宽度**。
+
+投机 lookahead 还可能在页边界临时触发各 group 多申请 block。若一次 draft `k` 个 token，
+某组额外 ID 为：
+
+```text
+ceil((当前页内余量不足的 token + k) / 该组有效 block token 数)
+```
+
+它只在跨越 8、32、128、512 或 16,384-token 边界时发生，不是每个 decode step 固定新增。
+
+#### MTP 相关临时 buffer
+
+- draft model 会先创建 `B × 512 × int32` Top-K buffer；
+- proposer 随后删除 draft buffer并复用 target buffer，稳定增量为 0：
+  [llm_base_proposer.py:463-470](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py:463)；
+- target `_mtp_hidden_buffer` 大小为
+  `B × hc_mult(4) × hidden_size(4096) × 2`：
+  [deepseek_v4.py:1081-1089](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/models/deepseek_v4.py:1081)。
+
+| `max_num_batched_tokens` | `_mtp_hidden_buffer` | Top-K buffer 启动瞬时值 |
+|---:|---:|---:|
+| 8,192 | 256 MiB | 16 MiB |
+| 10,240 | 320 MiB | 20 MiB |
+
+当前 target model 无条件创建 `_mtp_hidden_buffer`，所以“开关 MTP 的差值”不一定能从
+`memory_allocated` 中直接看到这 256/320 MiB；但它确实是 DeepSeek V4 服务启动的常驻显存。
 
 ---
 
@@ -505,54 +917,194 @@ Runner 使用 `torch.zeros(size, dtype=torch.int8, device=npu)` 申请原始字�
 
 ---
 
-## 7. 单请求实际占用量化
+## 7. Ascend 910B3 + BF16 场景的单请求实际占用
 
-### 7.1 历史缓存页数
+### 7.1 设备路径和精度口径
+
+当前 vLLM Ascend 并没有单独的 `910B3` 页面表。运行时 SoC version `220..225`
+统一映射到 `AscendDeviceType.A2`，因此 910B3 使用 A2/A3 的：
+
+```text
+block sizes = [128, 128, 8, 32]
+page sizes  = [16,640, 131,072]
+```
+
+代码依据：
+
+- 910B 系列 SoC 映射到 A2：
+  [utils.py:794-798](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/utils.py:794)
+- 非 A5 使用 A2/A3 页面表：
+  [layer.py:31-46](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/models/layer/attention/layer.py:31)
+
+“BF16 推理精度”在本节的 KV Cache 口径是：
+
+| 缓存 | 910B3 实际 dtype |
+|---|---|
+| 主压缩 KV | BF16 |
+| SWA，包括 MTP SWA | BF16 |
+| C4 Index key | INT8 |
+| C4 Index scale | FP16 |
+| Compressor state | FP32 |
+
+即使模型权重使用 BF16，也不应把 C4 Index 和 state 强行改成 BF16；这是当前
+vLLM Ascend A2 路径明确选择的混合缓存格式：
+[deepseek_v4.py:569-580](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/models/deepseek_v4.py:569)、
+[deepseek_v4.py:645-661](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/models/deepseek_v4.py:645)、
+[deepseek_v4.py:855-863](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/models/deepseek_v4.py:855)。
+
+### 7.2 历史缓存页数
 
 上下文长度为 `L`：
 
 ```text
-C4 历史页数
-  P4 = ceil(L / (128 × 4))
-     = ceil(L / 512)
+C4 历史 block ID
+  P4 = ceil(floor(L / 4) / 128)
 
-C128 历史页数
-  P128 = ceil(L / (128 × 128))
-       = ceil(L / 16384)
+C128 历史 block ID
+  P128 = ceil(floor(L / 128) / 128)
 ```
 
-稳定解码、恰好处于页边界时：
+代码先把原始 token 数按压缩比做整数除法，再按 128 个压缩行分页：
+[single_type_kv_cache_manager.py:35-58](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/core/single_type_kv_cache_manager.py:35)。
+因此只有已经形成的完整 4-token/128-token 压缩行才需要主缓存 slot。在本文 8K、133K、
+135K 和 1M 示例上，上式数值分别与 `ceil(L/512)`、`ceil(L/16384)` 相同；但在刚越过
+512/16,384 原始 token 边界、尚未形成下一压缩行时，两种写法会相差一页，源码公式优先。
+
+稳定 Decode 不是永远固定在一个 block 数，而是在两个调度相位之间变化。
+
+**低水位**出现在当前 token 已完成、并且长度刚好落在各窗口 block 边界之后：
 
 ```text
-block_ids_aligned
+block_ids_low
   = P4
     + P128
-    + 2        # 两个 SWA group
-    + 1        # C4 state group
-    + 4        # C128 state，128/32
+    + 2        # 两个 SWA group，各保留一页
+    + 1        # C4 state: 8-token 窗口恰好一页
+    + 4        # C128 state: 128-token 窗口 / 32 rows
   = P4 + P128 + 7
 ```
 
-由于窗口可能跨页，稳定阶段上界可再增加：
+**高水位**出现在调度器为下一个 token 建立 slot mapping 后。每个滑动窗口 manager
+都可能同时持有“仍有有效 token 的旧页”和“即将写入的新页”，因此分别多一页：
 
-- 两个 SWA group 各 1 个；
-- C4 state 1 个；
-- C128 state 1 个；
+```text
+2 个 SWA group × 1
+  + C4 state × 1
+  + C128 state × 1
+  = 4 个 block ID
+```
 
-即最多多 4 个 block ID，约 12.83 MiB。
+对单 token Decode，长期活动 block ID 范围因此是：
 
-### 7.2 稳定 Decode 阶段
+```text
+P4 + P128 + 7
+  到
+P4 + P128 + 11
+```
 
-| 上下文 L | P4 | P128 | 对齐 block ID | 块池占用 | 有效页面载荷 | 有效载荷率 |
-|---:|---:|---:|---:|---:|---:|---:|
-| 8,192 | 16 | 1 | 24 | 0.075 GiB | 0.067 GiB | 88.69% |
-| 133,120 | 260 | 9 | 276 | 0.865 GiB | 0.791 GiB | 91.49% |
-| 135,000 | 264 | 9 | 280 | 0.877 GiB | 0.803 GiB | 91.50% |
-| 1,048,576 | 2,048 | 64 | 2,119 | 6.639 GiB | 6.091 GiB | 91.74% |
+这 4 个 block 不是 allocator 随机碎片，而是 `remove_skipped_blocks()` 和
+`allocate_new_blocks()` 的执行顺序造成的确定性页尾相位：
 
-这些是**请求在稳定解码阶段的 resident 缓存**，不是完整序列准入预留。
+1. 先根据已经完成的 token 数释放完全滑出窗口的整页；
+2. 再按 `num_tokens_need_slot` 为当前 step 或 lookahead token 补新页；
+3. 旧页只有在所有有效 token 都离开后才能释放，所以窗口跨页时短暂同时持有两端。
 
-### 7.3 HF 参考连续缓存的 1M 计算
+源码：
+
+- 先回收、后计算本 step 新块：
+  [kv_cache_manager.py:389-420](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/kv_cache_manager.py:389)
+- 只有完整滑出的 block 才会被替换成 null block：
+  [single_type_kv_cache_manager.py:448-501](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/single_type_kv_cache_manager.py:448)
+- SWA 跳过 token 公式：
+  [single_type_kv_cache_manager.py:767-793](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/single_type_kv_cache_manager.py:767)
+
+MTP 开启时每个 ID 的物理 slab 为 3,364,096 B，所以高低水位最多相差：
+
+```text
+4 × 3,364,096
+  = 13,456,384 B
+  = 12.833 MiB
+```
+
+### 7.3 稳定 Decode 的 910B3 实际块池账
+
+以下采用 MTP 开启后的物理 slab：
+
+```text
+21 小页 + 23 大页
+  = 3,364,096 B/block ID
+```
+
+| 上下文 `L` | `P4` | `P128` | 活动 block ID | NPU 块池占用 | 有效页面载荷 |
+|---:|---:|---:|---:|---:|---:|
+| 8,192 | 16 | 1 | 24-28 | 0.075-0.088 GiB | 0.067-0.077 GiB |
+| 133,120 | 260 | 9 | 276-280 | 0.865-0.877 GiB | 0.791-0.802 GiB |
+| 135,000 | 264 | 9 | 280-284 | 0.877-0.890 GiB | 0.803-0.813 GiB |
+| 1,048,576 | 2,048 | 64 | 2,119-2,123 | 6.639-6.651 GiB | 6.091-6.101 GiB |
+
+1M 的低水位完整推导：
+
+```text
+block ID
+  = 2048 C4
+    + 64 C128
+    + 2 SWA
+    + 1 C4 state
+    + 4 C128 state
+  = 2119
+
+物理块池占用
+  = 2119 × 3,364,096
+  = 7,128,519,424 bytes
+  = 6.638951 GiB
+```
+
+低水位有效载荷按各 group 实际使用页面计算：
+
+```text
+2048 × 3,101,952        # C4 Full
+  + 64 × 2,621,440      # C128 Full
+  + 2 × 2,883,584       # 两个 SWA group
+  + 1 × 3,101,952       # C4 State
+  + 4 × 2,621,440       # C128 State
+  = 6,539,924,736 B
+  = 6.090780 GiB
+```
+
+高水位再增加 4 个 ID：
+
+```text
+物理块池占用
+  = 2123 × 3,364,096
+  = 6.651483 GiB
+
+新增有效页面载荷
+  = 2 × 2,883,584    # 两个 SWA group
+    + 3,101,952      # C4 State
+    + 2,621,440      # C128 State
+  = 11,490,560 B
+
+高水位有效载荷
+  = 6,551,415,296 B
+  = 6.101481 GiB
+```
+
+这些都是请求稳定 Decode 阶段的 resident cache，不是 Prefill 准入预留。单点监控如果
+恰好采在 step 结束后会看到低水位；按调度 step 采集 high-watermark 才会看到 2,123。
+
+### 7.4 MTP 开关对同一请求的 KV 差值
+
+MTP 关闭时物理 slab 为 3,233,024 B；开启时为 3,364,096 B。
+
+| 上下文 | 活动 block ID | MTP off | MTP on | MTP KV 差值 |
+|---:|---:|---:|---:|---:|
+| 8,192 | 24-28 | 0.072-0.084 GiB | 0.075-0.088 GiB | 3.0-3.5 MiB |
+| 133,120 | 276-280 | 0.831-0.843 GiB | 0.865-0.877 GiB | 34.5-35.0 MiB |
+| 1,048,576 | 2,119-2,123 | 6.380-6.392 GiB | 6.639-6.651 GiB | 264.875-265.375 MiB |
+
+这个差值来自每个已占用 ID 多一页 128 KiB MTP SWA，不是 block ID 数增加。
+
+### 7.5 与 Hugging Face 连续缓存参考实现的 1M 对照
 
 按 43 主层、无 MTP、batch size 为 1：
 
@@ -567,75 +1119,159 @@ block_ids_aligned
 | C128 状态 | `20 × 128 × 1024 × 4` | 10,485,760 |
 | **总计** |  | **7,232,045,056 = 6.735 GiB** |
 
-参考实现注释明确说明 Indexer 当前缓存使用 BF16：
+参考实现的 Indexer cache 使用 BF16：
+[inference/model.py:419](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/553034d7dd9e06c2eeaee68cf85a17d6d4754cf0/inference/model.py#L419)。
 
-- [inference/model.py:419](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/553034d7dd9e06c2eeaee68cf85a17d6d4754cf0/inference/model.py#L419)
-
-vLLM Ascend A2/A3 把 Indexer key 改为 INT8，并额外保存 FP16 scale：
-
-- [patch_kv_cache_interface.py:29-52](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/patch/platform/patch_kv_cache_interface.py:29)
-
-所以有效页面载荷比参考实现低约 9.57%，但共享 slab 物理占用只低约 1.43%。
+vLLM Ascend 910B3 路径把它改成 INT8 key + FP16 scale，所以有效载荷减少；但共享
+block slab、C4 state 50% padding 和全局 ID 锁定又吃回了大部分节省。最终判断不能只比较
+“连续张量有效字节”，必须比较 NPU 上实际 `num_blocks × physical_slab`。
 
 ---
 
-## 8. 为什么 Prefill 准入峰值远高于稳定占用
+## 8. 为什么存在 Prefill 准入峰值，以及 chunk size 为什么收益不同
 
-### 8.1 运行时准入门
+### 8.1 先定义“准入峰值”
 
-调度器对新请求使用 `full_sequence_must_fit`：
+这里的“Prefill 准入峰值”不是指服务启动后立刻为一个请求预分配全部块，而是：
 
-1. 计算完整序列在各 group 的最大 block 需求；
-2. 应用滑动窗口/压缩组的 admission cap；
-3. 如果需求超过 free blocks，返回 `None`，请求继续等待；
-4. 真正执行当前 chunk 前，先回收已经滑出窗口的旧块；
-5. 再为本 chunk 分配新块。
+> 调度器在把一个 waiting 请求放入运行队列前，估算该请求完成整个输入序列时，各缓存
+> group 可能需要的最大 block ID 数。如果当前 free blocks 连这个上界都容不下，就不让
+> 请求开始 Prefill。
 
-源码：[kv_cache_manager.py:244-458](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/kv_cache_manager.py:244)
+它有两个目的：
 
-### 8.2 滑动窗口的峰值公式
+1. 避免只检查第一个小 chunk，导致一个超长请求开始后永远无法完成；
+2. 降低长 Prefill 在中途反复抢块、被 preempt、重算和再次抢块的概率。
 
-`SlidingWindowSpec` 的上界：
+默认开关为 `scheduler_reserve_full_isl=True`：
+[scheduler.py:140-144](/Users/linyi/code/Documents/code/vllm/vllm/config/scheduler.py:140)。
+
+但它不是严格的未来容量预留：
+
+- 准入检查只比较预测需求和**当前** free blocks；
+- 通过后，真正分配的仍只是当前 chunk；
+- 预测出来但尚未使用的块不会从 free queue 中扣除；
+- 因此它是 admission gate，而不是 reservation object。
+
+### 8.2 调度和分配的完整代码链
+
+```mermaid
+sequenceDiagram
+    participant Q as Waiting Queue
+    participant S as Scheduler
+    participant K as KVCacheManager
+    participant C as Hybrid Coordinator
+    participant G as Six Group Managers
+    participant P as Global BlockPool
+
+    Q->>S: 新请求 / 恢复请求
+    S->>S: 查本地或外部 prefix hit
+    S->>S: num_new_tokens=min(剩余输入, token_budget, threshold)
+    S->>K: allocate_slots(... full_sequence_must_fit=True)
+    K->>C: 按完整 request.num_tokens 预测各组需求
+    C->>G: get_num_blocks_to_allocate(apply_admission_cap=True)
+    G-->>C: C4 + C128 + 2×SWA + C4State + C128State
+    C-->>K: 总 block ID 需求
+    alt 需求大于当前 free blocks
+        K-->>S: None，继续等待
+    else 可以准入
+        K->>C: remove_skipped_blocks()
+        C->>P: 释放已滑出窗口的旧 ID
+        K->>C: 按当前 chunk 再算真实增量
+        C->>P: 只申请当前 chunk 需要的新 ID
+        P-->>S: 当前 step 的 block tables
+    end
+```
+
+关键源码链：
+
+1. scheduler 先按 `long_prefill_token_threshold` 和 token budget 裁剪当前 chunk：
+   [scheduler.py:744-764](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/sched/scheduler.py:744)
+2. waiting 请求调用 `allocate_slots(... full_sequence_must_fit=...)`：
+   [scheduler.py:826-838](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/sched/scheduler.py:826)
+3. 完整序列准入使用 `full_num_tokens=request.num_tokens`：
+   [kv_cache_manager.py:372-387](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/kv_cache_manager.py:372)
+4. 真正分配前先回收旧窗口，再按本 chunk 重新算：
+   [kv_cache_manager.py:389-420](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/kv_cache_manager.py:389)
+5. coordinator 把六个 group 的需求相加：
+   [kv_cache_coordinator.py:129-180](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/kv_cache_coordinator.py:129)。
+
+### 8.3 为什么状态缓存只有 8/128 token，准入却随 chunk 增长
+
+滑动窗口类缓存的 admission cap：
 
 ```text
 max_blocks
   = ceil(
-      min(sliding_window - 1 + max_num_batched_tokens,
-          max_model_len)
+      min(sliding_window - 1 + B, max_model_len)
       / block_size
     )
     + 1
+
+B = max_num_batched_tokens
 ```
 
-源码：[kv_cache_interface.py:488-508](/Users/linyi/code/Documents/code/vllm/vllm/v1/kv_cache_interface.py:488)
+源码：[kv_cache_interface.py:488-508](/Users/linyi/code/Documents/code/vllm/vllm/v1/kv_cache_interface.py:488)。
 
-关键含义：
+直观过程：
 
-> 虽然状态窗口只有 8 或 128 个 token，但一个 8K/10K 的 Prefill chunk 开始前，需要同时为旧窗口尾部和本批新 token 提供 slot。窗口内旧块只能在下一次调度前被批量回收。
+```text
+执行 chunk 前：
+  保留上一个 chunk 末尾的 window-1 个状态
 
-### 8.3 压缩历史组的准入 cap
+执行本 chunk：
+  本批 B 个 token 都要有 slot mapping，
+  算子在 chunk 内逐 token 读旧 state、写新 state
 
-Ascend 的 `CompressAttentionManager` 在 block 计算前先除以压缩倍数：
+下一次调度前：
+  remove_skipped_blocks 才把已经完全滑出的旧 block ID 回收
+```
 
-- C4 的一个物理页按 512 个原始 token 计；
-- C128 的一个物理页按 16,384 个原始 token 计。
+因此 C4 state 虽然稳态只需要 8 个状态位置，Prefill 一个 `B=10,240` 的 chunk
+仍可能需要：
 
-源码：[single_type_kv_cache_manager.py:29-58](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/core/single_type_kv_cache_manager.py:29)
+```text
+ceil((8 - 1 + 10,240) / 8) + 1
+  = 1,282 个 block ID
+```
 
-Manager 配置的 admission cap 带一个安全余量，但基础 manager 会把真实需求与 cap 取最小值；因此没有 speculative lookahead 时，完整序列需求仍是 `ceil(L/(block_size×ratio))`，不应把安全余量强制加到每个请求：
+峰值主要来自“为整个 chunk 建立地址空间”，不是状态算法真的长期保存 10K token。
 
-- [single_type_kv_cache_manager.py:239-292](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/core/single_type_kv_cache_manager.py:239)
+### 8.4 压缩历史组与状态组的公式
 
-### 8.4 两个官方配方口径的峰值
+对“长度足够长、没有 prefix/external hit、waiting 请求第一次准入”的上界，长度为
+`L` 的请求可写成：
 
-vLLM Ascend DeepSeek V4 Flash 教程使用过：
+```text
+C4 Full
+  = ceil(floor(L / 4) / 128)
 
-- `max-num-batched-tokens=8192`；
-- A3 W8A8 配方使用 `10240`。
+C128 Full
+  = ceil(floor(L / 128) / 128)
 
-来源：[DeepSeek-V4-Flash.md:149、198](/Users/linyi/code/Documents/code/vllm-ascend/docs/source/tutorials/models/DeepSeek-V4-Flash.md:149)
+每个 SWA group
+  = min(ceil(L / 128), ceil((127 + B) / 128) + 1)
 
-#### 133,120 上下文，Prefill chunk 8192
+C4 State
+  = min(ceil(L / 8), ceil((7 + B) / 8) + 1)
+
+C128 State
+  = min(ceil(L / 32), ceil((127 + B) / 32) + 1)
+```
+
+压缩 Full manager 会在计算前除以压缩比：
+[single_type_kv_cache_manager.py:188-236](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/core/single_type_kv_cache_manager.py:188)。
+
+其中 `B=max_num_batched_tokens`。本章两个示例的 `L` 都远大于滑动窗口 admission cap，
+所以后续表格使用右侧 cap；短 prompt 必须使用上述 `min()`，不能直接套用 `B` 的峰值。
+压缩 Full 的代码精确口径是先做整数除法再按 128 行分页；在本文两个准入示例中分别
+等价于 `ceil(L/512)` 和 `ceil(L/16384)`。
+
+Full 需求随完整历史长度增长；SWA/state 则受 `B` 控制并在 chunk 之间回收。
+
+### 8.5 两个具体准入计算
+
+#### 133,120-token 请求，`B=8,192`
 
 | Group | admission block ID |
 |---|---:|
@@ -648,10 +1284,10 @@ vLLM Ascend DeepSeek V4 Flash 教程使用过：
 
 ```text
 1688 × 3,364,096
-= 5.289 GiB 块池占用
+  = 5.288603 GiB
 ```
 
-#### 1M 上下文，Prefill chunk 10240
+#### 1M-token 请求，`B=10,240`
 
 | Group | admission block ID |
 |---|---:|
@@ -664,27 +1300,99 @@ vLLM Ascend DeepSeek V4 Flash 教程使用过：
 
 ```text
 3883 × 3,364,096
-= 12.166 GiB 块池占用
+  = 12.165666 GiB
 ```
 
-### 8.5 降低 Prefill chunk 的容量收益
+### 8.6 chunk size 的容量收益怎么计算
 
-固定 1M 最大上下文：
+固定 `L=1,048,576`：
 
-| `max-num-batched-tokens` | admission block ID | 每请求块池预留 |
-|---:|---:|---:|
-| 512 | 2,211 | 6.927 GiB |
-| 1,024 | 2,299 | 7.203 GiB |
-| 2,048 | 2,475 | 7.754 GiB |
-| 4,096 | 2,827 | 8.857 GiB |
-| 8,192 | 3,531 | 11.063 GiB |
-| 10,240 | 3,883 | 12.166 GiB |
+| `B` | 每个 SWA group | C4 State | C128 State | 总 ID | admission gate 对应显存 |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 6 | 66 | 21 | 2,211 | 6.927 GiB |
+| 1,024 | 10 | 130 | 37 | 2,299 | 7.203 GiB |
+| 2,048 | 18 | 258 | 69 | 2,475 | 7.754 GiB |
+| 4,096 | 34 | 514 | 133 | 2,827 | 8.857 GiB |
+| 8,192 | 66 | 1,026 | 261 | 3,531 | 11.063 GiB |
+| 10,240 | 82 | 1,282 | 325 | 3,883 | 12.166 GiB |
 
-这说明：
+忽略取整时，`B` 每增加一个 token 带来的准入斜率约为：
 
-- 小 chunk 会提高长上下文可准入并发；
-- 大 chunk 一般有利于 Prefill 算子吞吐和通信效率；
-- DeepSeek V4 Flash 需要把 `max-num-batched-tokens` 当作**KV 容量参数**共同调优，而不只是计算批次参数。
+```text
+physical_slab × (
+    2 / 128       # 两个 SWA group
+  + 1 / 8         # C4 state
+  + 1 / 32        # C128 state
+)
+
+= 3,364,096 × 0.171875
+= 578,204 B/token
+= 0.5514 MiB/token
+```
+
+所以从 `B=2,048` 调到 `10,240`：
+
+```text
+ID 增量
+  = 3,883 - 2,475
+  = 1,408
+
+准入门增量
+  = 1,408 × 3,364,096
+  = 4.411 GiB/长请求
+```
+
+在只有 KV pool 容量约束时，理论可准入并发与每请求 ID 成反比：
+
+| 对比 `B=10,240` | 单请求 ID 降幅 | 理论长请求并发倍率上限 |
+|---|---:|---:|
+| `B=8,192` | 352 | `3883/3531 = 1.10×` |
+| `B=4,096` | 1,056 | `3883/2827 = 1.37×` |
+| `B=2,048` | 1,408 | `3883/2475 = 1.57×` |
+| `B=512` | 1,672 | `3883/2211 = 1.76×` |
+
+这是容量上限，不是端到端吞吐承诺；权重、激活、ACL Graph、Expert Parallel 通信和
+调度公平性都会进一步降低实际并发。
+
+### 8.7 为什么不同 workload 的收益不同
+
+| 场景 | 减小 chunk 的收益 | 主要原因 |
+|---|---|---|
+| 多个 100K-1M 长请求并发 Prefill | **很高** | C4 state 的 `B/8` 项占主导，直接解除准入门 |
+| Agentic 长历史 + 每轮短增量 | **中到高** | 若本地/外部 prefix 真命中，Full 历史新分配少，state/SWA 的 chunk 峰值更突出 |
+| 单个大请求、追求 Prefill tokens/s | **可能为负** | 小 chunk 增加迭代次数、调度和 kernel launch，矩阵规模变小 |
+| 短 prompt，长度小于 chunk | **很低** | 真实需求先被请求长度限制，降低 `B` 不一定减少 block |
+| P/D 分离 Prefill 节点 | **取决于网络重叠** | 小 chunk 易流水化，但会增加传输批次和元数据开销 |
+| Decode-only 节点 | **几乎无直接收益** | 正常 Decode 每请求只调度 1 个 token，Prefill chunk 不在热路径 |
+
+还要考虑 Ascend MLA 自己的 context workspace。它把历史上下文限制在最多 128K-token
+workspace，并按活跃 Prefill 数切成 context chunk：
+[attention/utils.py:16-41](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/attention/utils.py:16)、
+[mla_v1.py:494-529](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/attention/mla_v1.py:494)。
+
+因此：
+
+- scheduler chunk 变小首先降低 KV slot 峰值；
+- attention backend 仍可能把既有 context 再切片；
+- 两种 chunk 是不同层次，不能只调一个参数后把所有收益都归因于算子。
+
+### 8.8 推荐的评估方法
+
+对每个候选 `B` 同时测：
+
+1. `admission_blocks_per_request` 和实际 high-watermark blocks；
+2. waiting 请求数量、首次调度等待时间；
+3. Prefill tokens/s、单 chunk kernel 时间、迭代次数；
+4. preemption/recompute token 数；
+5. 910B3 `memory_allocated`、`memory_reserved` 和 NPU profiler HBM 带宽；
+6. Agentic 场景下 prefix hit 后真正新增的 C4/C128/SWA/state block。
+
+选择标准不应只是最高 Prefill tokens/s，而应是：
+
+```text
+单位 NPU 时间完成的有效请求 token
+  + 在目标 P99 TTFT 下可维持的并发会话数
+```
 
 ---
 
@@ -826,28 +1534,143 @@ Decode 仍按压缩边界筛选新压缩位置，并为 C4 准备 Lightning Inde
 - Compressor： [dsa_v1.py:2369-2389](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/attention/dsa_v1.py:2369)
 - 压缩 KV scatter： [dsa_v1.py:2404](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/attention/dsa_v1.py:2404)
 
-### 10.3 1M 上下文的逻辑读取上界
+### 10.3 一次 target Decode 到底读哪些缓存
 
-以下是代码结构对应的数据量上界，不是 NPU HBM 计数器实测值：
+先把“调用次数”和“字节数”分开。对一个 target 输出 token，43 个主层执行：
 
-| 组件 | 估算 | 每输出 token |
-|---|---|---:|
-| 21 层 C4 Index 扫描 | `21 × 262144 × 130` | 715,653,120 B |
-| 21 层 C4 Top-512 主 KV | `21 × 512 × 1024` | 11,010,048 B |
-| 20 层 C128 全压缩历史 | `20 × 8192 × 1024` | 167,772,160 B |
-| 44 层 SWA | `44 × 128 × 1024` | 5,767,168 B |
-| **合计** |  | **900,202,496 B = 0.838 GiB** |
+| 层类型 | 层数 | 每层语义读取 |
+|---|---:|---|
+| 纯 SWA | 2 | 1 次 SWA window |
+| C4 | 21 | 1 次 C4 Index 历史扫描 + 1 次 Top-512 主压缩 KV gather + 1 次 SWA window |
+| C128 | 20 | 1 次全 C128 压缩历史读取 + 1 次 SWA window |
 
-比例：
+所以语义上的 attention cache 读取组件数为：
 
-- C4 Index 扫描：79.5%；
-- C128 历史：18.6%；
-- C4 Top-512 主 KV：1.2%；
-- SWA：0.6%。
+```text
+21 Index scans
+  + 21 C4 main gathers
+  + 20 C128 history reads
+  + 43 SWA window reads
+  = 105 个缓存读取组件
+```
 
-实际 HBM 流量会受片上缓存、算子分块、重复读取、并行切分和 IndexCache 复用影响，必须用 NPU profiler 验证。
+这不是 105 个独立 kernel launch。Ascend DSA 算子可以把 SWA 和压缩历史注意力融合或分块，
+一个逻辑组件也可能产生多次 HBM transaction。
 
-### 10.4 IndexCache 的作用和边界
+MTP draft layer 不属于这 43 层 target pass。每执行一个 MTP draft step，额外运行一层
+SWA-only decoder，因此再增加一次 128-token SWA 读取，以及一整层 MTP 权重、激活和 MoE
+通信。
+
+### 10.4 1M 上下文的 attention cache 读取字节
+
+`L=1,048,576`：
+
+```text
+C4 压缩行数   = L / 4   = 262,144
+C128 压缩行数 = L / 128 = 8,192
+```
+
+不启用 IndexCache 复用时，target pass 的逻辑上界：
+
+| 组件 | 单层 | 层数 | 每 target token |
+|---|---:|---:|---:|
+| C4 Index key + scale 全扫描 | `262144 × 130 = 34,078,720 B` | 21 | 715,653,120 B |
+| C4 Top-512 主 KV | `512 × 1024 = 524,288 B` | 21 | 11,010,048 B |
+| C128 全压缩历史 | `8192 × 1024 = 8,388,608 B` | 20 | 167,772,160 B |
+| 主模型 SWA | `128 × 1024 = 131,072 B` | 43 | 5,636,096 B |
+| **target attention cache 合计** |  |  | **900,071,424 B = 0.838257 GiB** |
+
+如果本次 target token 后再执行一个 MTP draft step：
+
+```text
+MTP SWA
+  = 128 × 1024
+  = 131,072 B
+
+target + 1 draft
+  = 900,202,496 B
+  = 0.838379 GiB
+```
+
+占比以 target pass 为准：
+
+- C4 Index：79.51%；
+- C128 压缩历史：18.64%；
+- C4 Top-512 主 KV：1.22%；
+- 43 层 SWA：0.63%。
+
+这里没有把权重、MoE expert、激活、通信、片上缓存 miss 和 kernel 重复加载算进去。
+
+### 10.5 Compressor state 的读写
+
+每个 decode token 都要更新 Compressor state。按代码定义的一个状态向量计算：
+
+| State | 每层一次逻辑读取 | 层数 | 合计读取 | 合计写回 |
+|---|---:|---:|---:|---:|
+| C4 主 state | 8,192 B | 21 | 172,032 B | 172,032 B |
+| C4 Index state | 2,048 B | 21 | 43,008 B | 43,008 B |
+| C128 主 state | 4,096 B | 20 | 81,920 B | 81,920 B |
+| **合计** |  |  | **296,960 B** | **296,960 B** |
+
+这是状态向量的逻辑有效字节，不代表算子一定只产生一次连续 296,960-byte HBM 读取。
+state cache 是分页和 `as_strided` 视图，实际 transaction 取决于 compressor kernel。
+
+每个 target token 还固定写 43 行 SWA：
+
+```text
+43 × 1024 = 44,032 B
+```
+
+压缩历史写入是周期性的：
+
+```text
+C4 平均主 KV 写入
+  = 21 × 1024 / 4
+  = 5,376 B/token
+
+C4 Index 平均写入
+  = 21 × 130 / 4
+  = 682.5 B/token
+
+C128 平均写入
+  = 20 × 1024 / 128
+  = 160 B/token
+```
+
+在同时落到 128-token 公共边界时会出现一次小突发，但和 0.9 GB 级历史读取相比仍不是
+主要 TPOT 项。
+
+### 10.6 对 TPOT 的带宽下界
+
+只看上述 900,071,424-byte target attention cache：
+
+```text
+TPOT_KV_lower_bound
+  = 0.900071424 GB / 有效 KV 读取带宽(GB/s)
+```
+
+| 有效 KV 带宽 | 仅 KV 读取的理论下界 |
+|---:|---:|
+| 500 GB/s | 1.80 ms/token |
+| 1,000 GB/s | 0.90 ms/token |
+| 2,000 GB/s | 0.45 ms/token |
+
+这里使用“有效带宽”而不是设备标称 HBM 带宽，因为 43 层串行执行、地址离散、Top-K gather、
+算子分块和其他流量会让可用于 KV 的带宽明显低于硬件峰值。
+
+实际 TPOT 至少还要加：
+
+```text
+43 层 attention 计算
+  + 43 层 MoE/MLP 权重读取与 expert 通信
+  + normalization/projection
+  + sampler
+  + 可选 MTP draft 和 target verification
+```
+
+因此上表只能用来判断“KV 带宽能否成为一阶瓶颈”，不能直接预测端到端 TPOT。
+
+### 10.7 IndexCache 的作用和边界
 
 启用 `use_index_cache` 后，部分 C4 层可跳过自己的 Top-K 计算，复用前面 C4 层保存的 Top-K index。
 
@@ -868,307 +1691,631 @@ Decode 仍按压缩边界筛选新压缩位置，并为 C4 准备 Lightning Inde
 - C4 主 KV cache；
 - 共享 block pool 容量。
 
-所以这是 Decode 带宽/计算优化，不是当前实现下的 KV 容量优化。
+1M 时每跳过一层独立 Index scan，逻辑上可少读：
+
+```text
+262,144 × 130
+  = 34,078,720 B
+  = 32.5 MiB/token
+```
+
+在 1,000 GB/s 有效带宽下，单层理论节省约 0.034 ms；跳过 10 层约 0.341 GB/token，
+理论带宽下界减少约 0.34 ms。
+
+但 Top-K 复用会改变层级选择自由度，必须同时验证：
+
+- 接受率和生成质量；
+- TPOT/P99 TPOT；
+- Indexer kernel 次数；
+- NPU HBM read bytes；
+- `topk_indices_buffer` 是否真的复用而非复制。
+
+所以 IndexCache 是 Decode 带宽/计算优化，不是当前实现下的 KV 容量优化。
 
 ---
 
-## 11. 回收、前缀缓存与淘汰
+## 11. DeepSeek V4 的 Prefill 产出、Prefix 命中、回收和淘汰
 
-### 11.1 滑动窗口主动回收
+### 11.1 两个概念
 
-`remove_skipped_blocks()`：
+- **Prefill cache 管理**：当前请求执行 Prefill 时，如何申请页面、写入六类缓存并保留结果。
+- **Prefix cache 命中**：后续请求具有相同 token 前缀时，如何找到并复用已经完成的完整块。
 
-1. 计算已滑出窗口的 token；
-2. 把对应 request block 替换为 null block；
-3. 未进入 prefix cache 的 scratch block 放到 free queue 前部，优先立即复用；
-4. 已缓存 block 放到后部，尽量保留前缀复用价值。
+Prefill 产生的数据不会自动成为“永远保留的缓存”。只有完整 block 被赋予 hash；请求释放后，
+引用计数降到 0，它才成为 free queue 中“可命中、也可被重新分配淘汰”的候选。
 
-源码：[single_type_kv_cache_manager.py:448-501](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/single_type_kv_cache_manager.py:448)
+### 11.2 端到端生命周期
 
-滑动窗口跳过 token 数：
+```mermaid
+flowchart TD
+    A["Request 创建 token block hashes"] --> B["Scheduler: get_computed_blocks"]
+    B --> C["AscendHybridCoordinator 固定点查六组命中"]
+    C --> D{"共同命中长度"}
+    D -->|"0"| E["为 Prefill suffix 申请新 block IDs"]
+    D -->|">0"| F["touch 命中块，ref_cnt+1，移出 free queue"]
+    F --> E
+    E --> G["Prefill 写 SWA/state/C4/C128/index"]
+    G --> H["只给完整、可达 block 写 group-specific hash"]
+    H --> I["Decode 持续追加并回收滑出窗口的块"]
+    I --> J["请求结束 free: ref_cnt-1"]
+    J --> K{"block 是否有 hash"}
+    K -->|"有"| L["放 free queue 尾部，保留复用机会"]
+    K -->|"无"| M["放前部，优先作为 scratch 复用"]
+    L --> N["未来请求命中并 touch"]
+    L --> O["内存不足时从队首取出并删除 hash"]
+```
+
+### 11.3 Hash 的基础粒度和六组有效粒度
+
+DeepSeek V4 group block sizes包括 128、8、32。启用 prefix cache、CP=1 时：
 
 ```text
-max(0, num_computed_tokens - sliding_window + 1)
+hash_block_size
+  = gcd(128, 128, 128, 128, 8, 32)
+  = 8 token
+
+scheduler_block_size
+  = lcm(128, 128, 128, 128, 8, 32)
+  = 128 token
 ```
 
-源码：[single_type_kv_cache_manager.py:767-793](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/single_type_kv_cache_manager.py:767)
+Ascend CP patch 对多 group 同样显式计算 LCM/GCD：
+[patch_kv_cache_utils.py:20-56](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/patch/platform/patch_kv_cache_utils.py:20)。
 
-### 11.2 Prefix cache 的 block 生命周期
+每个 manager 再把基础 hash 聚合到自己的有效 block：
 
-`BlockPool` 同时维护：
+| Group | 物理行数 | 压缩倍数 | 一个可命中块覆盖原始 token |
+|---|---:|---:|---:|
+| C4 Full | 128 | 4 | 512 |
+| C128 Full | 128 | 128 | 16,384 |
+| SWA | 128 | 1 | 128 |
+| C4 State | 8 | 状态滚动 | 由 manager 的 SWA 规则约束 |
+| C128 State | 32 | 状态滚动 | 由 manager 的 SWA 规则约束 |
 
-- 全部 block；
-- free queue；
-- `block_hash -> block` 索引；
-- null block。
-
-源码：[block_pool.py:130-178](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/block_pool.py:130)
-
-完整 block 被写入 prefix cache：
-
-- 根据 request token hash 和 group ID 建立 key；
-- 不缓存 null block 或被 mask 的不可达 SWA block。
-
-源码：[block_pool.py:211-331](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/block_pool.py:211)
-
-### 11.3 本地淘汰不是单独后台扫描
-
-新分配从 free queue 头部取 block：
-
-```python
-ret = free_block_queue.popleft_n(num_blocks)
-_maybe_evict_cached_block(block)
-```
-
-如果取出的 block 仍带 prefix hash，就在被重新分配时删除 hash。
-
-源码：[block_pool.py:333-400](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/block_pool.py:333)
-
-因此本地策略更准确的描述是：
-
-> free queue 顺序驱动的缓存候选淘汰；被 touch 的命中块会从 free queue 移除并增加引用计数。
-
-不应把它简单描述成独立维护全局时间戳的严格 LRU。
-
-### 11.4 DeepSeek V4 的前缀命中对齐
-
-Compressed manager 使用：
+C4/C128 manager 使用：
 
 ```text
 logical_block_size
   = physical_block_size × compress_ratio
 ```
 
-即：
+源码：[single_type_kv_cache_manager.py:188-236](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/core/single_type_kv_cache_manager.py:188)。
 
-- C4：512 原始 token；
-- C128：16,384 原始 token。
+### 11.4 新请求如何找共同 prefix hit
 
-源码：[single_type_kv_cache_manager.py:188-236](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/core/single_type_kv_cache_manager.py:188)
+`KVCacheManager.get_computed_blocks()`：
 
-Hybrid coordinator 再取所有 attention type 的最小公倍数：
+1. prefix caching 关闭或请求要求跳过时直接返回 0；
+2. 最大命中长度设成 `request.num_tokens - 1`；
+3. 即使整个 prompt 命中，也至少重算最后一个 token 获得 logits；
+4. 调用 Ascend hybrid coordinator。
+
+源码：[kv_cache_manager.py:202-242](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/kv_cache_manager.py:202)。
+
+Ascend coordinator 的算法不是“只看 C4”：
+
+1. 按 spec 类型把相同 group 放到一起；
+2. 从候选最长长度开始；
+3. 每种 attention/cache type 检查自己能命中的长度；
+4. 任一类型缩短候选，就重新检查所有类型；
+5. 直到长度不再下降。
+
+这是一个单调递减的固定点过程：
+[patch_kv_cache_coordinator.py:217-307](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py:217)。
+
+为了确保所有 group 都落在完整块边界，最终命中长度还要对齐：
 
 ```text
-lcm_block_size = 16,384 token
+lcm(512, 16,384, 128, state effective sizes)
+  = 16,384 token
 ```
 
-源码：[patch_kv_cache_coordinator.py:203-210](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py:203)
+所以当前实现中，C4 即使能命中 100K 前缀，C128 只能给出 16K 边界，最终共同命中也会
+向下收缩到 16,384 的倍数。
 
-### 11.5 当前 SWA 前缀命中限制
+### 11.5 命中后如何接入当前请求
 
-源码注释明确记录：
+命中块不会复制一份：
 
-- DeepSeek V4 有两个 full-attention-like 压缩组；
-- 当前截断逻辑只完整处理第一个；
-- 由于 SWA，Decode 节点可能得不到 prefix cache hit。
+1. `block_pool.touch(new_computed_blocks)`；
+2. 如果 block 在 free queue 中，先移出；
+3. `ref_cnt += 1`；
+4. 把这些同一物理 ID 附加到当前请求各 group 的 block table；
+5. 已被 SWA 跳过的位置使用 null block 填充；
+6. 外部命中但尚未进入本地 HBM 的部分，再申请目标 block。
 
-来源：[patch_kv_cache_coordinator.py:310-316](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py:310)
+源码：
 
-这对 Agentic 多轮负载非常关键：
+- manager 接入命中块：
+  [single_type_kv_cache_manager.py:182-250](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/single_type_kv_cache_manager.py:182)
+- `touch`：
+  [block_pool.py:402-418](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/block_pool.py:402)
+- `allocate_slots` 先挂命中块再分配 suffix：
+  [kv_cache_manager.py:422-440](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/kv_cache_manager.py:422)。
 
-- 模型结构本身允许复用压缩历史；
-- 当前跨组命中协调可能被 SWA group 限制；
-- 不能只看 `enable_prefix_caching=True` 就假定多轮历史已完整复用。
+### 11.6 Prefill 结果什么时候进入 prefix hash
 
----
+当前 chunk 完成后，`cache_blocks()` 只提交已经 finalized 的 token，并只缓存完整块：
 
-## 12. Offload：从 NPU 移到 CPU
+```text
+num_tokens_to_cache
+  = min(total_computed + num_new_tokens,
+        request.num_tokens)
+```
 
-### 12.1 Simple CPU Offload
+draft token 可能被拒绝，因此不会提前写进 prefix hash：
+[kv_cache_manager.py:444-456](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/kv_cache_manager.py:444)。
 
-Ascend simple offload worker：
+`BlockPool.cache_full_blocks()`：
 
-1. 遍历所有 KV cache tensor；
-2. 按底层 storage 指针去重；
-3. 把每张 tensor 暴露为 `[num_blocks, block_bytes]`；
-4. 在 CPU pinned memory 中创建镜像；
-5. 使用独立 NPU stream 做 load/store。
+- 从 request 已生成的 token hashes 取对应 hash；
+- 加上 `kv_cache_group_id`，同一 token block 在不同 group 中是不同 key；
+- null block 不缓存；
+- SWA 不可达或被 mask 的块不缓存；
+- 只给 full block 设置 `block_hash`。
 
-源码：[simple_kv_offload/worker.py:75-158](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/simple_kv_offload/worker.py:75)
+源码：[block_pool.py:211-331](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/block_pool.py:211)。
 
-它特意根据 tensor shape 和 stride 算页面，而不是使用 `storage.nbytes()`，原因是 KV transfer 模式会多申请 2 MiB 对齐空间。
+### 11.7 滑动窗口和 state 如何主动回收
 
-源码：[simple_kv_offload/worker.py:160-224](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/simple_kv_offload/worker.py:160)
+每次为新 chunk/token 分配前，先调用 `remove_skipped_blocks()`：
 
-### 12.2 DMA 粒度
+```text
+num_skipped_tokens
+  = max(0, num_computed_tokens - sliding_window + 1)
+```
 
-`copy_blocks()` 为所有 sub-tensor 和 block ID 生成地址数组，再调用一次：
+处理动作：
+
+1. 已完全滑出窗口的 request block 替换为 null block；
+2. 没有 prefix hash 的 scratch block 放 free queue 前部；
+3. 有 hash 的缓存块放尾部，继续保留命中价值；
+4. 当前窗口和当前 state 所需 block 继续持有。
+
+源码：
+
+- 通用回收：
+  [single_type_kv_cache_manager.py:448-501](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/single_type_kv_cache_manager.py:448)
+- SWA 跳过长度：
+  [single_type_kv_cache_manager.py:767-793](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/single_type_kv_cache_manager.py:767)。
+
+### 11.8 请求结束后的“缓存”和“空闲”可以同时成立
+
+请求结束时，各 group manager 对 block `ref_cnt -= 1`：
+
+- `ref_cnt > 0`：仍有其他请求共享，不能释放；
+- `ref_cnt == 0` 且有 hash：进入 free queue，但仍可 prefix hit；
+- `ref_cnt == 0` 且无 hash：普通空闲 scratch。
+
+所以 vLLM 本地 prefix cache 不是独立于 block pool 的第二份内存。缓存块本身就在 free queue
+里，只是在被真正覆盖前仍保留 hash。
+
+### 11.9 淘汰机制
+
+新申请从 free queue 头部取 block：
 
 ```python
-torch.ops._C_ascend.swap_blocks_batch(...)
+ret = free_block_queue.popleft_n(num_blocks)
+_maybe_evict_cached_block(block)
 ```
 
-源码：[npu_mem_ops.py:71-99](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/simple_kv_offload/npu_mem_ops.py:71)
+如果取出的 block 仍带 hash：
 
-对 DeepSeek V4 的影响：
+1. 从 `cached_block_hash_to_block` 删除；
+2. 清除 block hash；
+3. 可选发送 `BlockRemoved` 事件；
+4. 把这个 ID 交给新请求。
 
-- 一个全局 block ID 对应约 3.208 MiB 物理 slab；
-- simple offload 的参数包含全部 unique cache tensor；
-- 它不如 group-aware Mooncake transfer 容易只搬 C4/C128/SWA 中真正归属该 group 的页面；
-- 小粒度频繁换入换出会放大 PCIe/HCCS 带宽和延迟。
+源码：[block_pool.py:333-400](/Users/linyi/code/Documents/code/vllm/vllm/v1/core/block_pool.py:333)。
 
-### 12.3 适合下沉什么
+因此本地淘汰更准确地说是：
 
-优先级应为：
+> free queue 顺序驱动的惰性淘汰；命中通过 `touch` 延长驻留，真正覆盖时才删除 hash。
 
-1. 冷的 C4/C128 历史完整块；
-2. 长时间不活跃会话的完整 prefix；
-3. 不应优先下沉当前 SWA 窗口和 Compressor state；
-4. 不应为几百 token 的短 Agent turn 频繁做完整 slab swap。
+它不是一个独立后台线程维护的严格全局 LRU。
 
-simple offload 更适合容量兜底，不适合在低延迟 Decode 热路径上高频抖动。
+### 11.10 当前 DeepSeek V4 Prefix 命中的实现边界
+
+当前 Ascend coordinator 已经有六组固定点查找，但源码仍明确记录两个问题：
+
+1. DeepSeek V4 有 C4、C128 两个 full-attention-like 压缩组；
+2. 最后统一截断代码只显式截断第一个 full group；
+3. SWA group 可能把共同 `hit_length` 降到 0，导致 Decode 节点没有 prefix hit。
+
+来源：[patch_kv_cache_coordinator.py:310-323](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py:310)。
+
+因此 Agentic 多轮场景不能只验证 `enable_prefix_caching=True`，还必须逐组打点：
+
+- C4 hit tokens；
+- C128 hit tokens；
+- 两个 SWA group hit tokens；
+- C4/C128 state hit tokens；
+- fixed-point 前后的最终共同 hit length；
+- 最后实际跳过的 Prefill token 数。
 
 ---
 
-## 13. Mooncake P2P 与 KV Cache Pool
+## 12. 多级 KV Cache 的统一分层
 
-### 13.1 P/D 分离的 Mooncake P2P
+### 12.1 先把组件角色分开
 
-Hybrid connector：
+| 组件 | 它负责什么 | 它不负责什么 |
+|---|---|---|
+| vLLM/vLLM Ascend `BlockPool` | NPU HBM 页面分配、引用计数、本地 prefix hash、回收 | 跨节点持久化 |
+| Simple CPU Offload | 单机 HBM 与 pinned DRAM 之间 swap | 分布式元数据和共享存储 |
+| Mooncake Transfer Engine connector | P/D 节点之间直接搬运已知地址范围 | 长期对象存储、全局淘汰策略 |
+| AscendStore + Mooncake Store | 分布式 DRAM/SSD 对象池、lookup、lease、eviction | NPU kernel 内部页面分配 |
+| OmniCache | hugetlbfs 主机池、OX P/D 传输、HBM lane/host mapping | 当前代码尚未完整表达 DeepSeek V4 六种 dtype/page family |
 
-1. 为各缓存组保存 base address、block length、stride；
-2. 对连续 block ID 合并传输；
-3. 通过 `addr_group_idx` 跳过不属于当前 group 的底层 tensor；
-4. 批量执行 `batch_transfer_sync_read`。
+不能把这些都简称为“Mooncake/Offload”。Transfer Engine 是数据面，Mooncake Store 是存储层，
+vLLM BlockPool 是执行时 allocator，OmniCache 又是另一套 host-pool 数据面。
 
-源码：[mooncake_hybrid_connector.py:545-621](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_hybrid_connector.py:545)
+### 12.2 推荐的三层结构
 
-相对 simple CPU offload：
+```mermaid
+flowchart TB
+    H["L0 NPU HBM: vLLM BlockPool"] -->|"evict/store"| W["L1 Host DRAM: pinned/hugetlbfs warm cache"]
+    W -->|"put/get"| C["L2 Distributed DRAM/SSD: AscendStore + Mooncake Store"]
+    C -->|"promotion"| W
+    W -->|"prefetch/load"| H
 
-- P2P 是 group-aware；
-- 能合并连续 block；
-- 可直接 NPU 到 NPU；
-- 支持 MTP cache transfer。
+    P["Prefill Worker"] -->|"Mooncake P2P 或 OX，二选一"| D["Decode Worker"]
+    P --> H
+    D --> H
+```
 
-MTP transfer：[mooncake_hybrid_connector.py:670-674](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_hybrid_connector.py:670)
+对于 DeepSeek V4，缓存冷热优先级不应按“整条序列”统一处理：
 
-### 13.2 AscendStore 外部 KV Pool
+| 缓存族 | 推荐层级 | 原因 |
+|---|---|---|
+| C4 Index key + scale | 优先 HBM | 1M 时约占 target KV 读流量 79.5%，每 token 要扫描 |
+| 当前 SWA window | HBM | 小而延迟敏感，每层每 token 都读 |
+| 当前 Compressor state | HBM | 小、每 token 读写，不能等待换入 |
+| C4 主压缩历史 | HBM 或 host warm，按选择块预取 | 全历史容量大，但每层只 gather Top-512 |
+| C128 主压缩历史 | HBM/host 分层 | 1M 时每 token 仍顺序读约 160 MiB |
+| 长时间不活跃会话的完整 C4/C128 prefix | Host/分布式池 | 容量大、复用间隔长 |
 
-KV Cache Pool 目标是把片上 HBM、主机 DRAM 和 SSD 组织为共享前缀池：
+### 12.3 vLLM Ascend Simple CPU Offload
 
-- [KV Cache Pool Guide](/Users/linyi/code/Documents/code/vllm-ascend/docs/source/developer_guide/Design_Documents/KV_Cache_Pool_Guide.md:1)
+实现流程：
 
-Worker 按 group 建立 key metadata：
+1. 遍历所有 KV cache tensor；
+2. 按底层 storage pointer 去重；
+3. 依据 tensor shape/stride 构造 `[num_blocks, block_bytes]` 视图；
+4. 为每个 unique tensor 创建 pinned CPU mirror；
+5. 使用独立 NPU load/store stream。
+
+源码：[simple_kv_offload/worker.py:75-158](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/simple_kv_offload/worker.py:75)。
+
+它不使用 `storage.nbytes()`，因为 KV transfer 路径会为 2 MiB 对齐多申请 storage：
+[simple_kv_offload/worker.py:160-224](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/simple_kv_offload/worker.py:160)。
+
+优势：
+
+- 对 vLLM 当前真实 tensor layout 最贴近；
+- 能保留 BF16、INT8、FP16 scale、FP32 state 的实际页面；
+- 单机部署简单。
+
+局限：
+
+- 它按 unique tensor 和 block ID 生成 swap 地址；
+- DeepSeek V4 一个 ID 背后是 44 个底层 tensor；
+- 如果策略层只知道“ID 冷了”，容易搬运该 ID 的大量 slab 子页面；
+- 高频换入当前 SWA/state 会直接伤害 TPOT。
+
+适合作为单机容量兜底，不适合作为每 token 触发的热路径缓存。
+
+### 12.4 Mooncake P2P connector
+
+Hybrid connector 是 group-aware：
+
+1. 按 group 取得 remote/local block IDs；
+2. 合并连续 block ID；
+3. 用 `addr_group_idx` 跳过不属于当前 group 的底层 tensor；
+4. 批量调用 `batch_transfer_sync_read`。
+
+源码：[mooncake_hybrid_connector.py:545-621](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_hybrid_connector.py:545)。
+
+它相对 simple offload 的关键优势是：
+
+- 传输时知道 group；
+- 能只搬当前 group 对应的 tensor 地址；
+- 可合并连续 block；
+- 可直接 NPU-to-NPU；
+- MTP layer 在最后 PP stage 只传一次：
+  [mooncake_hybrid_connector.py:670-674](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_hybrid_connector.py:670)。
+
+但它是 P/D transfer data plane，不等同于一个可跨请求长期保留、自动淘汰的共享 KV Store。
+
+### 12.5 AscendStore + Mooncake Store
+
+AscendStore 为外部 KV 对象构造的 key 包含：
 
 - model；
 - tensor/head rank；
-- prefill/decode context parallel rank；
-- pipeline rank；
+- PCP/DCP rank；
 - group ID；
 - cache role；
-- cache family。
+- cache family，例如 `c4`、`c128`；
+- layer ID 和 chunk hash。
 
-源码：[config_data.py:20-95](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/config_data.py:20)
+源码：[config_data.py:100-137](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/config_data.py:100)。
 
-Mooncake backend 支持：
+Mooncake Store 提供：
 
-- Ascend protocol；
-- 普通 transfer engine；
-- A3 Fabric Memory 直接路径；
-- multi-buffer batch put/get；
-- 可选 SSD offload；
-- 每个 tensor parallel rank 使用独立 SSD 目录。
+- memory/disk replica；
+- lease 和 soft pin；
+- eviction watermark/ratio；
+- offload-on-evict；
+- disk hit promotion 回 memory。
 
-源码：[mooncake_backend.py:61-157](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py:61)
+代码依据：
 
-### 13.3 外部池最小传输粒度是 16,384 token
+- replica、soft pin、hard pin 和 preferred segment：
+  [replica.h:82-88](/Users/linyi/code/Documents/code/mooncake/mooncake-store/include/replica.h:82)
+- lease 授予和刷新：
+  [master_service.cpp:716-750](/Users/linyi/code/Documents/code/mooncake/mooncake-store/src/master_service.cpp:716)
+- eviction high watermark 和 eviction ratio：
+  [master_service.cpp:3690-3715](/Users/linyi/code/Documents/code/mooncake/mooncake-store/src/master_service.cpp:3690)
+- memory eviction 时 offload：
+  [master_service.cpp:5015-5035](/Users/linyi/code/Documents/code/mooncake/mooncake-store/src/master_service.cpp:5015)
+- disk-only hit 的 memory promotion：
+  [master_service.cpp:1340-1375](/Users/linyi/code/Documents/code/mooncake/mooncake-store/src/master_service.cpp:1340)
 
-Pool scheduler：
+这些是外部对象生命周期；vLLM 本地 `BlockPool` 的 free queue/hash 是另一套生命周期。
+
+### 12.6 DeepSeek V4 的外部池粒度
+
+AscendStore 计算：
 
 ```text
 family_granularity
   = group_block_size × compress_ratio
 
 cache_transfer_granularity
-  = lcm(all group block sizes,
-        all family granularities)
+  = lcm(group block sizes,
+        family granularities)
 ```
 
 源码：
 
-- [get_cache_family_granularity](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/config_data.py:115)
-- [_infer_cache_transfer_granularity](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py:150)
+- [config_data.py:121-137](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/config_data.py:121)
+- [pool_scheduler.py:150-162](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py:150)。
 
 DeepSeek V4：
 
 ```text
-C4    = 128 × 4   = 512
-C128  = 128 × 128 = 16,384
-SWA   = 128
-State = 8 / 32
+C4    = 128 × 4   = 512 token
+C128  = 128 × 128 = 16,384 token
+SWA   = 128 token
+State = 8 / 32 rows
 
-LCM = 16,384
+跨 family LCM = 16,384 token
 ```
 
-默认 `discard_partial_chunks=True` 时，prompt 长度会向下取整到 16,384 的倍数；少于一个粒度直接不查询外部缓存。
+默认 `discard_partial_chunks=True`：
 
-源码：[pool_scheduler.py:224-250](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py:224)
+- 8K system prompt 不查询外部池；
+- 20K 最多查询前 16K；
+- Agent 每轮新增 1K，需要累计跨过下一个 16K 边界才形成新外部 chunk。
 
-Agentic 影响：
+源码：[pool_scheduler.py:224-250](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py:224)。
 
-- 8K system prompt 无法形成一次完整外部池命中；
-- 20K prompt 最多命中前 16K；
-- 每轮新增 1K token 时，要累计跨过下一个 16K 边界，外部池才会出现新的完整块；
-- 对 100K 以上稳定长会话仍有明显价值。
-
-### 13.4 SWA 传输会被裁剪
-
-Pool scheduler 对滑动窗口 group 只保留最后：
+SWA group 只保留最后：
 
 ```text
 ceil(sliding_window / block_size) + 1
 ```
 
-个 block。
+个 block，避免存储无用旧窗口：
+[pool_scheduler.py:186-222](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py:186)。
 
-源码：[pool_scheduler.py:186-222](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py:186)
+当前 hybrid group 不能启用 layerwise load：
+[pool_scheduler.py:72-73](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py:72)。
+因此大 prefix 仍可能在首 token 前集中加载，不能逐层与 forward 完整重叠。
 
-这避免把已经不可能参与注意力的旧 SWA 页面写入外部池。
+---
 
-### 13.5 当前不支持 DeepSeek V4 hybrid layerwise pool
+## 13. vLLM/vLLM Ascend、Mooncake、OmniCache 横向对比与组合
 
-Scheduler 和 Worker 都明确拒绝：
+### 13.1 横向对比
 
-```python
-if use_layerwise and num_kv_cache_groups > 1:
-    raise NotImplementedError
+| 维度 | vLLM HBM BlockPool | Simple CPU Offload | Mooncake P2P | AscendStore + Mooncake Store | OmniCache |
+|---|---|---|---|---|---|
+| 主介质 | NPU HBM | pinned DRAM | 两端 NPU/注册内存 | 分布式 DRAM/SSD | hugetlbfs Host + HBM lane |
+| 调度单位 | 全局 block ID/group table | block ID × unique tensor | group block ranges | 16K 对齐外部 chunk | host block + per-group HBM lane |
+| DeepSeek V4 六组 | 原生核心实现 | 能镜像真实 tensor | hybrid group-aware | hybrid group-aware，非 layerwise | 有 DSA/stride 插件，但当前端到端适配不完整 |
+| Prefix metadata | 本地 hash + group ID | 复用 vLLM | 请求级 P/D metadata | 全局 key/lease | connector/host pool 自身映射 |
+| 淘汰 | free queue 惰性淘汰 | CPU 容量策略 | 不负责持久淘汰 | lease/watermark/DRAM-SSD eviction | host pool/block 生命周期 |
+| Decode 热路径 | 最低延迟 | 需 H2D | 预先传完后走 HBM | 命中需 load | 可 H2D，也可 host MMU 读取 |
+
+### 13.2 OmniCache 当前实现做了什么
+
+本地源码 commit：
+
+```text
+a57a8f0cc757992495ac79daa48c340bfd60b761
 ```
+
+项目定位是：
+
+```text
+Prefill HBM
+  -> hugetlbfs host pool
+  -> OX
+  -> Decode host pool
+  -> HBM 或 NPU MMU host mapping
+```
+
+来源：[README.md:14-18](/Users/linyi/code/Documents/code/omni-cache/README.md:14)。
+
+关键机制：
+
+- host pool 使用 mmap hugepage；
+- Decode 为请求声明独立 HBM lane；
+- SWA 只 H2D 最近窗口块；
+- 非 SWA attention group 可按 block 全量装入；
+- host mapping 模式下，配置说明为“DSA Indexer 留在 HBM，其余 KV 经 NPU MMU 读 host”。
 
 源码：
 
-- [pool_scheduler.py:72-73](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py:72)
-- [pool_worker.py:127-128](/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py:127)
+- HBM lane 和分组 H2D：
+  [decode.py:239-391](/Users/linyi/code/Documents/code/omni-cache/omni_cache/cache/transfer_engine/decode.py:239)
+- SWA tail 裁剪：
+  [decode.py:355-380](/Users/linyi/code/Documents/code/omni-cache/omni_cache/cache/transfer_engine/decode.py:355)
+- host mapping 配置：
+  [CONFIG_REFERENCE.md:5-10](/Users/linyi/code/Documents/code/omni-cache/docs/CONFIG_REFERENCE.md:5)。
 
-因此当前 DeepSeek V4：
+### 13.3 为什么当前 OmniCache 不能直接宣称完整支持 V4 Flash
 
-- 可以使用 hybrid group-aware pool；
-- 不能使用逐层加载来把网络传输与逐层前向充分重叠；
-- 超大 prefix load 更容易形成首 token 前的集中传输延迟。
+代码中已有 DSA、stride compressor、gather selection 和 hybrid group 扩展点，但存在四个
+DeepSeek V4 适配缺口。
 
-### 13.6 Mooncake 自身淘汰
+#### 1. Host pool 固定 BF16
 
-当前 Mooncake 配置包含：
+`KVCacheMemoryPool` 明确设置：
 
-- `default_kv_lease_ttl`；
-- `default_kv_soft_pin_ttl`；
-- `allow_evict_soft_pinned_objects`；
-- `eviction_ratio`；
-- `eviction_high_watermark_ratio`。
+```python
+self.dtype = torch.bfloat16
+self.element_size = 2
+```
 
-来源：[master.yaml](/Users/linyi/code/Documents/code/Mooncake/mooncake-store/conf/master.yaml:1)
+源码：[memory_pool.py:37-75](/Users/linyi/code/Documents/code/omni-cache/omni_cache/cache/memory/memory_pool.py:37)。
 
-Mooncake 还具有：
+而 V4 需要同时保留：
 
-- LRU eviction strategy 测试；
-- memory replica 和 disk replica；
-- SSD offload；
-- offload-on-evict 路径。
+- BF16 主压缩 KV/SWA；
+- INT8 C4 Index；
+- FP16 Index scale；
+- FP32 state。
 
-这些是外部存储池对象淘汰，与 vLLM 本地 `BlockPool` 的 block 再分配淘汰是两套独立生命周期。
+如果统一按 BF16 host slot 存放，会改变格式或放大容量；如果只存部分组件，又必须有
+family-aware layout metadata。
+
+#### 2. Decode 初始化使用 fake uniform FullAttentionSpec
+
+非 Pangu DSA 路径把 `head_size` 固定为 128，并为所有 layer 构造同一种
+`FullAttentionSpec`：
+[decode_omni_cache.py:451-522](/Users/linyi/code/Documents/code/omni-cache/omni_cache/cache/decode/decode_omni_cache.py:451)。
+
+这不能自然表达 V4 的：
+
+```text
+C4 Full + C128 Full + 2×SWA + C4 State + C128 State
+```
+
+#### 3. 压缩 metadata 存在 group/ratio 硬编码
+
+当前 fake block table 使用：
+
+```text
+metadata_grp_id == 2 -> block_size × 3
+else                 -> block_size × 128
+```
+
+并按固定 group 3/4 跳过：
+[compress.py:130-177](/Users/linyi/code/Documents/code/omni-cache/omni_cache/attention/metadata/compress.py:130)。
+
+DeepSeek V4 的压缩比是 4 和 128，不能把 `×3` 或固定 group ID 直接复用。
+
+#### 4. 文档和 DSA split 主要针对 Pangu V2
+
+DSA split 文档明确使用 Pangu V2 的 `576 + 128` BF16 slot：
+[CONFIG_REFERENCE.md:110-126](/Users/linyi/code/Documents/code/omni-cache/docs/CONFIG_REFERENCE.md:110)。
+
+V4 A2 的 C4 index 是 INT8+FP16 scale，主 KV 是共享 512 维 latent，布局不同。
+
+结论：
+
+> OmniCache 的 host pool、HBM lane、MMU mapping 和异步流水思想对 V4 很有价值，但当前
+> commit 不能未经改造就认定为 DeepSeek V4 Flash 六类缓存的完整可用实现。
+
+### 13.4 三者如何协调，而不是重复搬运
+
+推荐所有权：
+
+```text
+Scheduler/BlockPool
+  = 唯一的本地 block ID 和引用计数 owner
+
+L1 Host Cache
+  = Simple Offload 或 OmniCache 二选一作为本机 warm tier
+
+P/D Data Plane
+  = Mooncake P2P 或 OmniCache OX 二选一搬同一份请求缓存
+
+L2 Shared Store
+  = AscendStore + Mooncake Store 负责跨请求/跨节点持久 prefix
+```
+
+不建议：
+
+- Simple CPU Offload 和 OmniCache 同时管理同一批 block 的 host 副本；
+- Mooncake P2P 和 OX 对同一请求重复发送；
+- 本地 BlockPool、Omni host pool、Mooncake Store 各自独立决定同一 prefix 的有效长度。
+
+### 13.5 可组合的推荐数据流
+
+#### 方案 A：当前代码最接近的生产路径
+
+```text
+vLLM HBM BlockPool
+  + Mooncake P2P 做 Prefill->Decode
+  + AscendStore/Mooncake Store 做跨请求共享 prefix
+```
+
+优点：DeepSeek V4 group/cache family 语义最完整。缺点：外部粒度 16K，hybrid layerwise
+尚未支持。
+
+#### 方案 B：单机超大并发
+
+```text
+vLLM HBM BlockPool
+  + Simple CPU Offload
+```
+
+只下沉 inactive session 的 C4/C128 完整历史；SWA/state 固定 HBM。需要补 group-aware
+冷热策略，避免按全 slab 无差别 swap。
+
+#### 方案 C：OmniCache 改造后的目标
+
+```text
+vLLM scheduler/block hash
+  -> V4 family-aware Omni host pool
+  -> OX P/D
+  -> Decode: Index/SWA/state 常驻 HBM
+  -> C4/C128 history 按层预取或 host mapping
+  -> 冷 prefix 再写 Mooncake Store
+```
+
+该方案需要新增：
+
+1. 每个 cache family 独立 dtype、page size 和 block table；
+2. 从 vLLM `KVCacheConfig` 动态生成布局，删除固定 group ID；
+3. C4 main/index/state 原子化版本和命中长度；
+4. C128 16K family 与 C4 512-token family 的独立传输 chunk；
+5. per-layer async prefetch，解除当前 hybrid layerwise 限制；
+6. 单一 cache key namespace，包含 model revision、group、family、TP/PP/CP rank、dtype/layout version。
+
+### 13.6 V4 的建议分层策略
+
+| 状态 | HBM | Host warm | Mooncake Store |
+|---|---|---|---|
+| 活跃 Decode | C4 Index、SWA、state、当前需要的 C4/C128 | 预取队列 | 不在热路径同步访问 |
+| 短暂停顿会话 | Index 可保留，SWA/state 视容量 | C4/C128 全历史 | 可异步写 |
+| 长时间 inactive | 仅保留高复用公共 prefix | 完整会话或淘汰 | DRAM/SSD 持久 |
+| 新 Agent turn | 先本地 hash，再 host，再远端 | 命中后预热 HBM | 只补缺失完整 chunk |
+
+核心原则：
+
+> C4 Index、SWA 和 state 是 Decode 延迟层；C4/C128 历史是容量层；远端 Store 是复用层。
+> 三类数据不应使用同一淘汰和预取策略。
 
 ---
 
 ## 14. 面向 Agentic 超长多轮负载的瓶颈拆解
+
+> 本轮按要求暂不继续深化第 14 章。以下保留上一版内容，待第 4 至 13 章的口径确认后再统一重算和修订。
 
 ### 14.1 短会话：固定状态和页尾成本更明显
 
@@ -1250,6 +2397,8 @@ recomputed_prompt_tokens
 ---
 
 ## 15. 优化建议
+
+> 本轮按要求暂不继续深化第 15 章。以下保留上一版建议，后续将基于已确认的 910B3、MTP、Prefill 峰值和多级缓存口径重新排序。
 
 ### 15.1 P0：增加 DeepSeek V4 KV Memory Ledger
 
