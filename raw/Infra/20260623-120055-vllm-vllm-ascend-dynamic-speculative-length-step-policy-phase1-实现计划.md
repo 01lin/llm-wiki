@@ -1,5 +1,10 @@
 # vLLM / vLLM Ascend Step 级动态投机长度 Implementation Plan
 
+> 实施状态（2026-06-23）：本地可实施部分已完成。实际落地提交、与原计划的文件级差异、
+> 本地验证证据及 910B3/910C 验收矩阵见
+> `20260623-144500-vllm-vllm-ascend-dynamic-speculative-length-phase1-实现与NPU验证.md`。
+> NPU E2E、精度、TPOT 和长稳结论仍待昇腾环境验证。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > `superpowers:subagent-driven-development` or `superpowers:executing-plans` to
 > implement this plan task-by-task. Steps use checkbox syntax for tracking.
