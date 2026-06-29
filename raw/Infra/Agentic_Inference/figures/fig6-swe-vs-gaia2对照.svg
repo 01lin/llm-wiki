@@ -1,0 +1,22 @@
+<svg width="520" height="260" viewBox="0 0 520 260" xmlns="http://www.w3.org/2000/svg" role="img" font-family="-apple-system,Segoe UI,Roboto,sans-serif">
+<text x="260.0" y="22" font-size="14" text-anchor="middle" font-weight="bold" fill="#222">SWE 单agent vs gaia2 多agent — 关系维对照</text>
+<text x="104" y="71.66666666666667" font-size="11" text-anchor="end" font-weight="normal" fill="#333">fan-out</text>
+<rect x="110" y="44.0" width="66.0377358490566" height="25.666666666666668" rx="2" fill="#9aa7b5"/>
+<text x="180.03773584905662" y="69.66666666666667" font-size="10" text-anchor="start" font-weight="normal" fill="#666">1</text>
+<rect x="110" y="72.66666666666667" width="350.0" height="25.666666666666668" rx="2" fill="#7b4ad9"/>
+<text x="464.0" y="99.33333333333334" font-size="10" text-anchor="start" font-weight="normal" fill="#666">5.3</text>
+<text x="104" y="135.0" font-size="11" text-anchor="end" font-weight="normal" fill="#333">join数</text>
+<rect x="110" y="107.33333333333334" width="0.0" height="25.666666666666668" rx="2" fill="#9aa7b5"/>
+<text x="114.0" y="133.0" font-size="10" text-anchor="start" font-weight="normal" fill="#666">0</text>
+<rect x="110" y="136.0" width="66.0377358490566" height="25.666666666666668" rx="2" fill="#7b4ad9"/>
+<text x="180.03773584905662" y="162.66666666666669" font-size="10" text-anchor="start" font-weight="normal" fill="#666">1</text>
+<text x="104" y="198.33333333333334" font-size="11" text-anchor="end" font-weight="normal" fill="#333">并行度</text>
+<rect x="110" y="170.66666666666669" width="66.0377358490566" height="25.666666666666668" rx="2" fill="#9aa7b5"/>
+<text x="180.03773584905662" y="196.33333333333334" font-size="10" text-anchor="start" font-weight="normal" fill="#666">1</text>
+<rect x="110" y="199.33333333333334" width="171.69811320754718" height="25.666666666666668" rx="2" fill="#7b4ad9"/>
+<text x="285.6981132075472" y="226.00000000000003" font-size="10" text-anchor="start" font-weight="normal" fill="#666">2.6</text>
+<circle cx="120" cy="250" r="5" fill="#9aa7b5" stroke="#fff" stroke-width="2"/>
+<text x="130" y="254" font-size="10" text-anchor="start" font-weight="normal" fill="#222">SWE单agent</text>
+<circle cx="260" cy="250" r="5" fill="#7b4ad9" stroke="#fff" stroke-width="2"/>
+<text x="270" y="254" font-size="10" text-anchor="start" font-weight="normal" fill="#222">gaia2多agent</text>
+</svg>

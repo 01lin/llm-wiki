@@ -1,0 +1,67 @@
+<svg width="100%" viewBox="0 0 680 520" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>Markov 头如何把并行候选串成自回归</title>
+<desc>每一步用上一个采出的词查偏置表，叠加到基础分数上再采样，逐步串联</desc>
+<defs>
+<marker id="ar3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#888"/></marker>
+<marker id="ar3b" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#3b9a82"/></marker>
+</defs>
+
+<text font-family="sans-serif" font-size="14" fill="#1a1a1a" x="40" y="28" font-weight="500">放大盒子④：Markov 头把"并行7个独立候选"串成"前后有关系"</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="40" y="48">公式：最终分数 = 基础分 U_k  ＋  偏置 B_k（B_k = 查"上一个词"得到的修正）</text>
+
+<text font-family="sans-serif" font-size="14" fill="#8a6d1e" x="40" y="78" font-weight="500">偏置怎么来：B = W2( W1[上一个词] )  —— 两步查表</text>
+<rect fill="#fbeacb" stroke="#dcab4e" stroke-width="1.5" x="40" y="88" width="185" height="58" rx="6"/>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="58" y="110" font-weight="500">W1：词 → 256维向量</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="58" y="130">查表 Embedding(词表,256)</text>
+<line x1="225" y1="117" x2="255" y2="117" stroke="#888" stroke-width="1.5" marker-end="url(#ar3)"/>
+<rect fill="#fbeacb" stroke="#dcab4e" stroke-width="1.5" x="258" y="88" width="185" height="58" rx="6"/>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="276" y="110" font-weight="500">W2：256维 → 词表分数</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="276" y="130">Linear(256, 151936)</text>
+<line x1="443" y1="117" x2="473" y2="117" stroke="#888" stroke-width="1.5" marker-end="url(#ar3)"/>
+<rect fill="#fbeacb" stroke="#dcab4e" stroke-width="1.5" x="476" y="88" width="164" height="58" rx="6"/>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="494" y="110" font-weight="500">B = 一份词表偏置</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="494" y="130">"上个词的余味"</text>
+
+<text font-family="sans-serif" font-size="14" fill="#2f7d43" x="40" y="178" font-weight="500">串行循环：7 步，每步把上一步采的词喂进来（markov_head.py for 循环）</text>
+
+<rect fill="#d8eedb" stroke="#79bd83" stroke-width="1.5" x="40" y="192" width="140" height="86" rx="8"/>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="58" y="214" font-weight="500">第1步</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="58" y="234">上个词 = anchor</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="58" y="252">U₁ + B(anchor)</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="58" y="270">采样 → x₁</text>
+<line x1="180" y1="235" x2="212" y2="235" stroke="#3b9a82" stroke-width="2" marker-end="url(#ar3b)"/>
+<text font-family="sans-serif" font-size="12" fill="#2f7d43" x="196" y="226" text-anchor="middle">x₁</text>
+
+<rect fill="#d8eedb" stroke="#79bd83" stroke-width="1.5" x="214" y="192" width="140" height="86" rx="8"/>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="232" y="214" font-weight="500">第2步</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="232" y="234">上个词 = x₁</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="232" y="252">U₂ + B(x₁)</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="232" y="270">采样 → x₂</text>
+<line x1="354" y1="235" x2="386" y2="235" stroke="#3b9a82" stroke-width="2" marker-end="url(#ar3b)"/>
+<text font-family="sans-serif" font-size="12" fill="#2f7d43" x="370" y="226" text-anchor="middle">x₂</text>
+
+<rect fill="#d8eedb" stroke="#79bd83" stroke-width="1.5" x="388" y="192" width="140" height="86" rx="8"/>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="406" y="214" font-weight="500">第3步</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="406" y="234">上个词 = x₂</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="406" y="252">U₃ + B(x₂)</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="406" y="270">采样 → x₃</text>
+<line x1="528" y1="235" x2="560" y2="235" stroke="#3b9a82" stroke-width="2" marker-end="url(#ar3b)"/>
+<text font-family="sans-serif" font-size="12" fill="#2f7d43" x="558" y="226" text-anchor="middle">…</text>
+
+<rect fill="#f0f0ee" stroke="#b8b8b2" stroke-width="1.5" x="562" y="192" width="78" height="86" rx="8"/>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="580" y="226">直到</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="580" y="246">第7步</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="580" y="266">x₇</text>
+
+<rect fill="#dce9fb" stroke="#7aa7e0" stroke-width="1.5" x="40" y="300" width="600" height="74" rx="8"/>
+<text font-family="sans-serif" font-size="14" fill="#1a1a1a" x="60" y="324" font-weight="500">为什么这样能缓解"越往后越不准"</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="60" y="346">并行骨干里，x₃ 不知道 x₂ 猜了啥 → 后面容易跑偏（suffix decay）</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="60" y="366">Markov 头让每一步都看到"上一步真正采出的词" → 接上了前后文</text>
+
+<rect fill="#e7dcf5" stroke="#a886d4" stroke-width="1.5" x="40" y="388" width="600" height="110" rx="8"/>
+<text font-family="sans-serif" font-size="14" fill="#1a1a1a" x="60" y="412" font-weight="500">成本极低：循环里不重跑那 5 层骨干</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="60" y="434">· U₁..U₇ 是骨干一次性算好的，固定不变</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="60" y="454">· 每步只做：查 W1（1次）+ 过 W2（1次）+ 加法（1次）</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="60" y="474">· 所以 7 步串行虽然排队，但每步便宜到几乎不耗时</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="60" y="494">· 这就是"半自回归"：骨干并行（快） + Markov 串行（轻）</text>
+</svg>

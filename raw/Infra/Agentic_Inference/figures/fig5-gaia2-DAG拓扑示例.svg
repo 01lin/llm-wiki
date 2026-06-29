@@ -1,0 +1,39 @@
+<svg width="560" height="360" viewBox="0 0 560 360" xmlns="http://www.w3.org/2000/svg" role="img" font-family="-apple-system,Segoe UI,Roboto,sans-serif">
+<text x="280.0" y="24" font-size="14" text-anchor="middle" font-weight="bold" fill="#222">gaia2 DAG 拓扑示例 (fan-out=4, join=4)</text>
+<line x1="280.0" y1="110.33333333333334" x2="140.0" y2="183.00000000000003" stroke="#bbb" stroke-width="1.5"/>
+<line x1="280.0" y1="110.33333333333334" x2="280.0" y2="183.00000000000003" stroke="#bbb" stroke-width="1.5"/>
+<line x1="280.0" y1="110.33333333333334" x2="420.0" y2="183.00000000000003" stroke="#bbb" stroke-width="1.5"/>
+<line x1="280.0" y1="207.00000000000003" x2="93.33333333333333" y2="279.6666666666667" stroke="#bbb" stroke-width="1.5"/>
+<line x1="140.0" y1="207.00000000000003" x2="186.66666666666666" y2="279.6666666666667" stroke="#bbb" stroke-width="1.5"/>
+<line x1="420.0" y1="207.00000000000003" x2="186.66666666666666" y2="279.6666666666667" stroke="#bbb" stroke-width="1.5"/>
+<line x1="140.0" y1="207.00000000000003" x2="280.0" y2="279.6666666666667" stroke="#bbb" stroke-width="1.5"/>
+<line x1="420.0" y1="207.00000000000003" x2="280.0" y2="279.6666666666667" stroke="#bbb" stroke-width="1.5"/>
+<line x1="140.0" y1="207.00000000000003" x2="373.3333333333333" y2="279.6666666666667" stroke="#bbb" stroke-width="1.5"/>
+<line x1="420.0" y1="207.00000000000003" x2="373.3333333333333" y2="279.6666666666667" stroke="#bbb" stroke-width="1.5"/>
+<line x1="140.0" y1="207.00000000000003" x2="466.66666666666663" y2="279.6666666666667" stroke="#bbb" stroke-width="1.5"/>
+<line x1="420.0" y1="207.00000000000003" x2="466.66666666666663" y2="279.6666666666667" stroke="#bbb" stroke-width="1.5"/>
+<circle cx="140.0" cy="195.00000000000003" r="12" fill="#4a90d9" stroke="#fff" stroke-width="2"/>
+<text x="140.0" y="221.00000000000003" font-size="9" text-anchor="middle" font-weight="normal" fill="#555">add_calend</text>
+<circle cx="280.0" cy="195.00000000000003" r="12" fill="#4a90d9" stroke="#fff" stroke-width="2"/>
+<text x="280.0" y="221.00000000000003" font-size="9" text-anchor="middle" font-weight="normal" fill="#555">add_to_car</text>
+<circle cx="420.0" cy="195.00000000000003" r="12" fill="#4a90d9" stroke="#fff" stroke-width="2"/>
+<text x="420.0" y="221.00000000000003" font-size="9" text-anchor="middle" font-weight="normal" fill="#555">add_calend</text>
+<circle cx="93.33333333333333" cy="291.6666666666667" r="12" fill="#4a90d9" stroke="#fff" stroke-width="2"/>
+<text x="93.33333333333333" y="317.6666666666667" font-size="9" text-anchor="middle" font-weight="normal" fill="#555">checkout</text>
+<circle cx="186.66666666666666" cy="291.6666666666667" r="12" fill="#7b4ad9" stroke="#fff" stroke-width="2"/>
+<text x="186.66666666666666" y="317.6666666666667" font-size="9" text-anchor="middle" font-weight="normal" fill="#555">send_messa</text>
+<circle cx="280.0" cy="291.6666666666667" r="12" fill="#7b4ad9" stroke="#fff" stroke-width="2"/>
+<text x="280.0" y="317.6666666666667" font-size="9" text-anchor="middle" font-weight="normal" fill="#555">send_messa</text>
+<circle cx="373.3333333333333" cy="291.6666666666667" r="12" fill="#7b4ad9" stroke="#fff" stroke-width="2"/>
+<text x="373.3333333333333" y="317.6666666666667" font-size="9" text-anchor="middle" font-weight="normal" fill="#555">send_messa</text>
+<circle cx="466.66666666666663" cy="291.6666666666667" r="12" fill="#7b4ad9" stroke="#fff" stroke-width="2"/>
+<text x="466.66666666666663" y="317.6666666666667" font-size="9" text-anchor="middle" font-weight="normal" fill="#555">send_messa</text>
+<circle cx="280.0" cy="98.33333333333334" r="12" fill="#e07b39" stroke="#fff" stroke-width="2"/>
+<text x="280.0" y="124.33333333333334" font-size="9" text-anchor="middle" font-weight="normal" fill="#555">USER</text>
+<circle cx="20" cy="348" r="6" fill="#e07b39" stroke="#fff" stroke-width="2"/>
+<text x="30" y="352" font-size="10" text-anchor="start" font-weight="normal" fill="#222">USER根</text>
+<circle cx="100" cy="348" r="6" fill="#4a90d9" stroke="#fff" stroke-width="2"/>
+<text x="110" y="352" font-size="10" text-anchor="start" font-weight="normal" fill="#222">AGENT子任务</text>
+<circle cx="210" cy="348" r="6" fill="#7b4ad9" stroke="#fff" stroke-width="2"/>
+<text x="220" y="352" font-size="10" text-anchor="start" font-weight="normal" fill="#222">join汇聚点</text>
+</svg>

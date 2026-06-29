@@ -1,0 +1,49 @@
+<svg width="100%" viewBox="0 0 680 540" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>DSpark 单步采样实现</title>
+<desc>U_k 与 B_k 在 logits 空间相加后，按温度走贪心 argmax 或 softmax 多项式采样</desc>
+<defs><marker id="s1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#888"/></marker></defs>
+
+<text font-family="sans-serif" font-size="14" fill="#1a1a1a" x="40" y="28" font-weight="500">单步采样实现（markov_head.py 循环内 + sampling.py）</text>
+
+<rect fill="#fbeacb" stroke="#dcab4e" stroke-width="1.5" x="40" y="46" width="285" height="58" rx="8"/>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="58" y="70" font-weight="500">U_k：骨干基础分（lm_head 输出）</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="58" y="90">形状 [词表]，还没 softmax</text>
+<rect fill="#d8eedb" stroke="#79bd83" stroke-width="1.5" x="355" y="46" width="285" height="58" rx="8"/>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="373" y="70" font-weight="500">B_k：Markov 偏置 = W2(W1[上个词])</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="373" y="90">形状 [词表]，也是 logits</text>
+<line x1="182" y1="104" x2="320" y2="134" stroke="#888" stroke-width="1.5" marker-end="url(#s1)"/>
+<line x1="497" y1="104" x2="360" y2="134" stroke="#888" stroke-width="1.5" marker-end="url(#s1)"/>
+
+<rect fill="#e7dcf5" stroke="#a886d4" stroke-width="1.5" x="170" y="138" width="340" height="56" rx="8"/>
+<text font-family="sans-serif" font-size="14" fill="#1a1a1a" x="190" y="161" font-weight="500">step_logits = U_k + B_k（在 logits 空间相加）</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="190" y="181">关键：先加再 softmax ≠ 概率相加（softmax 非线性）</text>
+<line x1="340" y1="194" x2="340" y2="218" stroke="#888" stroke-width="1.5" marker-end="url(#s1)"/>
+
+<rect fill="#dce9fb" stroke="#7aa7e0" stroke-width="1.5" x="200" y="222" width="280" height="40" rx="8"/>
+<text font-family="sans-serif" font-size="14" fill="#1a1a1a" x="220" y="247" font-weight="500">sample_tokens(step_logits, temperature)</text>
+<line x1="270" y1="262" x2="190" y2="290" stroke="#888" stroke-width="1.5" marker-end="url(#s1)"/>
+<line x1="410" y1="262" x2="490" y2="290" stroke="#888" stroke-width="1.5" marker-end="url(#s1)"/>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="210" y="282">温度≈0</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="470" y="282">温度&gt;0</text>
+
+<rect fill="#d3efe8" stroke="#6cc0ac" stroke-width="1.5" x="40" y="294" width="280" height="92" rx="8"/>
+<text font-family="sans-serif" font-size="14" fill="#1a1a1a" x="58" y="318" font-weight="500">① 贪心（argmax）</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="58" y="340">直接取分数最高的词</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="58" y="360">不算 softmax，最省</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="58" y="380">temperature &lt; 1e-5 时走这条</text>
+
+<rect fill="#f9d6cd" stroke="#e08c79" stroke-width="1.5" x="360" y="294" width="280" height="92" rx="8"/>
+<text font-family="sans-serif" font-size="14" fill="#1a1a1a" x="378" y="318" font-weight="500">② 随机采样（multinomial）</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="378" y="340">logits / 温度 → softmax → 概率</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="378" y="360">按概率"掷骰子"抽一个词</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="378" y="380">温度越大越随机</text>
+
+<line x1="180" y1="386" x2="180" y2="410" stroke="#888" stroke-width="1.5" marker-end="url(#s1)"/>
+<line x1="500" y1="386" x2="500" y2="410" stroke="#888" stroke-width="1.5" marker-end="url(#s1)"/>
+<rect fill="#f0f0ee" stroke="#b8b8b2" stroke-width="1.5" x="40" y="414" width="600" height="40" rx="8"/>
+<text font-family="sans-serif" font-size="14" fill="#1a1a1a" x="60" y="439" font-weight="500">采出 x_k → 喂回循环下一步当"上个词"（串行依赖）</text>
+
+<rect fill="#dce9fb" stroke="#7aa7e0" stroke-width="1.5" x="40" y="466" width="600" height="58" rx="8"/>
+<text font-family="sans-serif" font-size="14" fill="#1a1a1a" x="60" y="490" font-weight="500">易错点：采样用 step_logits，但验证用的 draft 概率 q 另算</text>
+<text font-family="sans-serif" font-size="12" fill="#333333" x="60" y="510">循环还返回 corrected_logits(=step_logits)，之后 logits_to_probs 转成 q 给拒绝采样</text>
+</svg>

@@ -24,7 +24,7 @@
 
 ### 1.1 异步遮掩遮的到底是什么
 
-实测调用链（[model_runner_v1.py:2315](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:2315)~[2335](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:2335)）：
+实测调用链（[model_runner_v1.py:2315](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py)~[2335](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py)）：
 
 ```
 execute_model(scheduler_output):
@@ -33,16 +33,16 @@ execute_model(scheduler_output):
     if deferred_state_corrections_fn: deferred_state_corrections_fn()          # launch 后才纠偏
     return None    # ★ 不等结果，立即返回 → 调度器排下一步
 ```
-注释（[:2331](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:2331)）："Now the batch has been launched we can wait for corrections **without breaking async scheduling**"。
+注释（[:2331](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py)）："Now the batch has been launched we can wait for corrections **without breaking async scheduling**"。
 
 **遮掩本质**：`execute_model` 把前向 launch 到 NPU 后立即返回 → EngineCore 进程的「下一步 CPU 调度 + prepare_input」与「本步 NPU 前向」在时间轴上重叠。遮掩的是 **CPU 侧调度/准备开销**，被 NPU 前向时间掩盖。
 
 ### 1.2 动态投机长度为何不破坏遮掩
 
 逐项对照遮掩依赖的条件：
-- 遮掩依赖「execute_model 不阻塞返回」——与本步排几个草稿（k_active）**无关**。k_active 只改 draft 循环次数（[llm_base_proposer.py:566](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py:566)）和 verify token 数，不引入任何等待。
-- 跨步状态 `prev_num_draft_len`（[:1971](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:1971)）存的是**上一步实际草稿数**（非配置常量）→ 切换后下一步用新 k_active 排草稿、用旧值处理遗留，天然自洽，且已有 KeyError 兜底（[:696](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:696)）。
-- async 下 CPU 乐观假设「全接受」、GPU kernel 用上一步 `valid_sampled_token_count_gpu` 修正（[:1048](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:1048)）——这个修正逻辑**用 per-req 实际草稿数**，k_active 变化自动适配，不需要新同步。
+- 遮掩依赖「execute_model 不阻塞返回」——与本步排几个草稿（k_active）**无关**。k_active 只改 draft 循环次数（[llm_base_proposer.py:566](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py)）和 verify token 数，不引入任何等待。
+- 跨步状态 `prev_num_draft_len`（[:1971](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py)）存的是**上一步实际草稿数**（非配置常量）→ 切换后下一步用新 k_active 排草稿、用旧值处理遗留，天然自洽，且已有 KeyError 兜底（[:696](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py)）。
+- async 下 CPU 乐观假设「全接受」、GPU kernel 用上一步 `valid_sampled_token_count_gpu` 修正（[:1048](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py)）——这个修正逻辑**用 per-req 实际草稿数**，k_active 变化自动适配，不需要新同步。
 
 ### 1.3 性能不劣化与工程可行性判断
 
@@ -58,14 +58,14 @@ execute_model(scheduler_output):
 
 | 收益 | 机制 | 代码依据 |
 |------|------|---------|
-| 减草稿前向耗时 | k_active 减小 → draft 循环 `range(k_active)` 少跑几次草稿前向 | [llm_base_proposer.py:566](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py:566) |
+| 减草稿前向耗时 | k_active 减小 → draft 循环 `range(k_active)` 少跑几次草稿前向 | [llm_base_proposer.py:566](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py) |
 | 减 verify 耗时 | verify 输入总 token = `(1+k_active)×并发` → k_active 减小 → 主模型处理 token 数减少 → 计算量减少 | verify 前向 query 长度 = `1+k_active` |
 
 > 收益①永远能拿到（少跑循环，无约束）。**收益②受图模式约束**——这是前序方案的修正焦点。
 
 ### 2.2 图桶的真相（决定收益②能否拿到）
 
-实测（[cudagraph_dispatcher.py:211](vscode://file/Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py:211)~[230](vscode://file/Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py:230)）：
+实测（[cudagraph_dispatcher.py:211](file:///Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py)~[230](file:///Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py)）：
 
 ```python
 max_num_tokens = uniform_decode_query_len * max_num_seqs
@@ -74,7 +74,7 @@ cudagraph_capture_sizes_for_decode = [x for x in capture_sizes
 for bs in cudagraph_capture_sizes_for_decode:
     add_cudagraph_key(FULL, _create_padded_batch_descriptor(bs, uniform_decode=True, ...))
 ```
-而 `_create_padded_batch_descriptor`（[:107](vscode://file/Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py:107)~[117](vscode://file/Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py:117)）：
+而 `_create_padded_batch_descriptor`（[:107](file:///Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py)~[117](file:///Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py)）：
 ```python
 num_reqs = num_tokens_padded // uniform_decode_query_len
 assert num_tokens_padded % uniform_decode_query_len == 0   # ★ 整除约束
@@ -82,7 +82,7 @@ assert num_tokens_padded % uniform_decode_query_len == 0   # ★ 整除约束
 
 **关键事实（修正前序判断）**：
 1. 图桶的 key 维度是 **`num_tokens`**（一个离散桶集合），不是"query_len 固定值"。
-2. runtime 的 `num_tokens` 被 `_bs_to_padded_graph_size` **向上取整到最近桶**（[:141](vscode://file/Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py:141)）。
+2. runtime 的 `num_tokens` 被 `_bs_to_padded_graph_size` **向上取整到最近桶**（[:141](file:///Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py)）。
 3. 但 `num_reqs` 是用 `num_tokens_padded ÷ uniform_decode_query_len` 反推的——**这里的 `uniform_decode_query_len` 是初始化时固定的 `1+K_max`**。
 
 ### 2.3 两条技术路线（拿收益② vs 保证图命中）
@@ -92,14 +92,14 @@ assert num_tokens_padded % uniform_decode_query_len == 0   # ★ 整除约束
 | **A：padding 到 K_max**（前序方案） | 恒 `1+K_max` | `(1+K_max)×num_reqs` | ✅ 恒命中 | ❌ token 不减 | 无 |
 | **B：减 token 命中桶**（本文新增） | 真实 `1+k_active` | `(1+k_active)×num_reqs` | ⚠️ 需该 num_tokens 落桶 + 整除 | ✅ token 真减 | num_reqs 反推依赖 `uniform_decode_query_len` |
 
-**路线 B 的拦路虎（诚实标注）**：`_create_padded_batch_descriptor` 的 `num_reqs = num_tokens ÷ uniform_decode_query_len` 假设 query_len 恒为 `1+K_max`。若实际 query=`1+k_active`，则 `num_tokens=(1+k_active)×num_reqs` 除以 `1+K_max` 反推出的 num_reqs **错误** → FA3 scheduler_metadata 依赖 num_reqs（[:201](vscode://file/Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py:201) 注释 "FULL mode needs exact num_reqs"）→ 可能算错或掉图。
+**路线 B 的拦路虎（诚实标注）**：`_create_padded_batch_descriptor` 的 `num_reqs = num_tokens ÷ uniform_decode_query_len` 假设 query_len 恒为 `1+K_max`。若实际 query=`1+k_active`，则 `num_tokens=(1+k_active)×num_reqs` 除以 `1+K_max` 反推出的 num_reqs **错误** → FA3 scheduler_metadata 依赖 num_reqs（[:201](file:///Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py) 注释 "FULL mode needs exact num_reqs"）→ 可能算错或掉图。
 
 ### 2.4 推荐方案：分档 uniform_decode_query_len（路线 B 的可行实现）
 
 要让路线 B 成立，需让 dispatcher **按多个 `uniform_decode_query_len` 值（1+1, 1+2, …, 1+K_max）分别注册 FULL decode 图**，运行时按 k_active 选对应 query_len 的图集。即：
 
-- 启动期：对每个 `k ∈ {常用 k 值}`，以 `uniform_decode_query_len = 1+k` 跑一轮 dispatcher key 注册（[cudagraph_dispatcher.py:170](vscode://file/Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py:170) `initialize_cudagraph_keys(uniform_decode_query_len=1+k)`）。
-- runtime：[uniform_decode 判定](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:2867) 用 `1+k_active`，命中对应桶。
+- 启动期：对每个 `k ∈ {常用 k 值}`，以 `uniform_decode_query_len = 1+k` 跑一轮 dispatcher key 注册（[cudagraph_dispatcher.py:170](file:///Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py) `initialize_cudagraph_keys(uniform_decode_query_len=1+k)`）。
+- runtime：[uniform_decode 判定](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py) 用 `1+k_active`，命中对应桶。
 
 **取舍**：
 
@@ -130,10 +130,10 @@ assert num_tokens_padded % uniform_decode_query_len == 0   # ★ 整除约束
 |---------|-------------|---------------------|
 | 调度 latch k_active | CPU 整数读写（GIL 原子） | ❌ 无（纯 host） |
 | draft 循环 range(k_active) | 读 CPU 整数 | ❌ 无 |
-| 草稿 buffer 索引 [draft_step] | host pin_memory（[llm_base_proposer.py:208](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py:208)） | ❌ 无 |
+| 草稿 buffer 索引 [draft_step] | host pin_memory（[llm_base_proposer.py:208](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py)） | ❌ 无 |
 | verify token 数 = (1+k)×C | 由 attn_metadata 决定，CPU 侧算 | ❌ 无 |
-| 接受核算 | 现有 GPU 修正 kernel `update_num_computed_tokens_for_batch_change`（[:1051](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:1051)），`non_blocking=True` | ❌ 沿用，无新增 |
-| valid_sampled_token_count 回传 | 独立 stream + non_blocking + event（[:1627](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:1627)） | ❌ 沿用，无新增 |
+| 接受核算 | 现有 GPU 修正 kernel `update_num_computed_tokens_for_batch_change`（[:1051](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py)），`non_blocking=True` | ❌ 沿用，无新增 |
+| valid_sampled_token_count 回传 | 独立 stream + non_blocking + event（[:1627](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py)） | ❌ 沿用，无新增 |
 | 图选择 | dispatcher CPU 侧字典查 | ❌ 无（路线 B 多档也是 CPU 查表） |
 
 ### 3.2 零同步的实现保证（硬约束）
@@ -156,7 +156,7 @@ assert num_tokens_padded % uniform_decode_query_len == 0   # ★ 整除约束
 1. **第 2 点收益是硬需求 → 主方案改为路线 B（分档 uniform_decode_query_len）**，前序"padding 到 K_max"（路线 A）降为"显存吃紧时的退化备选"。
 2. 路线 B 代价：启动期按 K 档（或常用 k 集合）多捕获图，一次性显存+时间，不进热路径。
 3. 三点全部满足：① async 遮掩不破坏（与投机长度正交）；② verify 真减 token（路线 B）；③ 关键路径零新增同步（路线 B 比 A 更干净，无 PLACEHOLDER 填充）。
-4. **需 Phase 0 实测确认**：dispatcher 多档 query_len 注册的工程改动量 + K 档图的显存占用是否可接受；以及 FA3/DSA 的 scheduler_metadata 是否正确支持多 query_len 档（[:201](vscode://file/Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py:201) "FULL mode needs exact num_reqs" 的实际约束强度）。这是路线 B 当前最大不确定点。
+4. **需 Phase 0 实测确认**：dispatcher 多档 query_len 注册的工程改动量 + K 档图的显存占用是否可接受；以及 FA3/DSA 的 scheduler_metadata 是否正确支持多 query_len 档（[:201](file:///Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py) "FULL mode needs exact num_reqs" 的实际约束强度）。这是路线 B 当前最大不确定点。
 
 ### 待回写
 - 实现级设计 [[20260623-100003-vllm-ascend-动态投机长度-实现级设计-分析]]：§2.3 runner 改动从"padding"改为"按 k_active 选图档 + verify 真实 1+k_active token"。
@@ -168,12 +168,12 @@ assert num_tokens_padded % uniform_decode_query_len == 0   # ★ 整除约束
 
 | 主题 | 位置 |
 |------|------|
-| async 遮掩：launch 后 return None | [model_runner_v1.py:2315](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:2315)~[2335](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:2335) |
-| 图桶按 num_tokens 注册 + 整除约束 | [cudagraph_dispatcher.py:107](vscode://file/Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py:107)~[117](vscode://file/Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py:117) · [:211](vscode://file/Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py:211)~[230](vscode://file/Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py:230) |
-| num_tokens 向上取整到桶 | [cudagraph_dispatcher.py:141](vscode://file/Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py:141) |
-| initialize_cudagraph_keys(uniform_decode_query_len) | [cudagraph_dispatcher.py:170](vscode://file/Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py:170) |
-| FULL needs exact num_reqs | [cudagraph_dispatcher.py:201](vscode://file/Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py:201) |
-| async GPU 修正 kernel（无 D2H） | [model_runner_v1.py:1048](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:1048)~[1064](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:1064) |
-| valid_sampled_token_count 异步 stream | [model_runner_v1.py:1627](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:1627)~[1638](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:1638) |
-| draft 主循环 | [llm_base_proposer.py:566](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py:566) |
-| uniform_decode 判定 | [model_runner_v1.py:2867](vscode://file/Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:2867) |
+| async 遮掩：launch 后 return None | [model_runner_v1.py:2315](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py)~[2335](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py) |
+| 图桶按 num_tokens 注册 + 整除约束 | [cudagraph_dispatcher.py:107](file:///Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py)~[117](file:///Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py) · [:211](file:///Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py)~[230](file:///Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py) |
+| num_tokens 向上取整到桶 | [cudagraph_dispatcher.py:141](file:///Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py) |
+| initialize_cudagraph_keys(uniform_decode_query_len) | [cudagraph_dispatcher.py:170](file:///Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py) |
+| FULL needs exact num_reqs | [cudagraph_dispatcher.py:201](file:///Users/linyi/code/Documents/code/vllm/vllm/v1/cudagraph_dispatcher.py) |
+| async GPU 修正 kernel（无 D2H） | [model_runner_v1.py:1048](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py)~[1064](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py) |
+| valid_sampled_token_count 异步 stream | [model_runner_v1.py:1627](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py)~[1638](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py) |
+| draft 主循环 | [llm_base_proposer.py:566](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py) |
+| uniform_decode 判定 | [model_runner_v1.py:2867](file:///Users/linyi/code/Documents/code/vllm-ascend/vllm_ascend/worker/model_runner_v1.py) |
